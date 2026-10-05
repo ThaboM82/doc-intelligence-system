@@ -1,0 +1,55 @@
+version: "3.8"
+
+services:
+  # Vector Database for Dense & Hybrid Retrieval
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: doc_intel_qdrant
+    restart: always
+    ports:
+      - "6333:6333" # REST API & Web UI
+      - "6334:6334" # gRPC API
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+
+  # Relational Database for Document State & HITL Review Queues
+  postgres:
+    image: postgres:16-alpine
+    container_name: doc_intel_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: doc_user
+      POSTGRES_PASSWORD: doc_password
+      POSTGRES_DB: doc_intelligence
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # In-Memory Cache & Async Task Queue Broker
+  redis:
+    image: redis:7-alpine
+    container_name: doc_intel_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # Self-Hosted Local Model Serving Engine
+  ollama:
+    image: ollama/ollama:latest
+    container_name: doc_intel_ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  qdrant_data:
+  postgres_data:
+  redis_data:
+  ollama_data:
