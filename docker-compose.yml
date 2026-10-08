@@ -1,20 +1,66 @@
-version: "3.8"
-
 services:
-  # Vector Database for Dense & Hybrid Retrieval
+  # FastAPI Document Intelligence API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: doc_intel_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      # Qdrant
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_URL: http://qdrant:6333
+      VECTOR_STORE_TYPE: qdrant
+      # Postgres
+      DATABASE_URL: postgresql+asyncpg://doc_user:doc_password@postgres:5432/doc_intelligence
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: doc_user
+      POSTGRES_PASSWORD: doc_password
+      POSTGRES_DB: doc_intelligence
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      # Ollama
+      OLLAMA_HOST: http://ollama:11434
+      # API
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:8000"
+      RATE_LIMIT_MAX_REQUESTS: "300"
+      RATE_LIMIT_WINDOW_SECONDS: "60"
+      ADMIN_API_KEY: ""
+    volumes:
+      - api_data:/app/data
+    depends_on:
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - doc_intel_net
+
+  # Vector database
   qdrant:
-    image: qdrant/qdrant:v1.9.2
+    image: qdrant/qdrant:v1.12.5
     container_name: doc_intel_qdrant
     restart: always
     ports:
-      - "6333:6333" # REST API & Web UI
-      - "6334:6334" # gRPC API
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
-      - QDRANT__SERVICE__HTTP_PORT=6333
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    networks:
+      - doc_intel_net
 
-  # Relational Database for Document State & HITL Review Queues
+  # Relational DB
   postgres:
     image: postgres:16-alpine
     container_name: doc_intel_postgres
@@ -27,8 +73,15 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U doc_user -d doc_intelligence"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - doc_intel_net
 
-  # In-Memory Cache & Async Task Queue Broker
+  # Cache / broker
   redis:
     image: redis:7-alpine
     container_name: doc_intel_redis
@@ -37,8 +90,10 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    networks:
+      - doc_intel_net
 
-  # Self-Hosted Local Model Serving Engine
+  # Local LLM
   ollama:
     image: ollama/ollama:latest
     container_name: doc_intel_ollama
@@ -47,9 +102,16 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    networks:
+      - doc_intel_net
 
 volumes:
+  api_data:
   qdrant_data:
   postgres_data:
   redis_data:
   ollama_data:
+
+networks:
+  doc_intel_net:
+    driver: bridge

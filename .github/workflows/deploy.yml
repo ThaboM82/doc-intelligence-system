@@ -1,0 +1,91 @@
+name: CI/CD Pipeline (Render, Vercel & AWS Reference)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx
+
+      - name: Run pytest test suites
+        env:
+          OPENAI_API_KEY: "mock-key-for-ci"
+          QDRANT_URL: "http://localhost:6333"
+        run: |
+          pytest tests/
+
+  deploy-backend-render:
+    name: Deploy Backend to Render
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render Deploy Hook
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+
+  deploy-frontend-vercel:
+    name: Deploy Frontend to Vercel
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Vercel Production
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+          working-directory: '.' # Adjust to './frontend' if your frontend lives in a subfolder
+
+
+  # ==============================================================================
+  # REFERENCE: AWS ECS DEPLOYMENT (Commented out for future use)
+  # ==============================================================================
+  # To use this later:
+  # 1. Uncomment the job below.
+  # 2. Add a build-and-push-docker image step if pushing to Amazon ECR.
+  # 3. Populate the required AWS secrets in GitHub Repository Settings.
+  # ==============================================================================
+  # deploy-to-aws-ecs-reference:
+  #   name: [Reference] Deploy to Amazon ECS
+  #   needs: test
+  #   if: false # Set to true or remove 'if: false' when ready to switch/add AWS
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Configure AWS credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #         aws-region: ${{ secrets.AWS_REGION }}
+  #
+  #     - name: Update Amazon ECS service
+  #       run: |
+  #         aws ecs update-service \
+  #           --cluster ${{ secrets.ECS_CLUSTER }} \
+  #           --service ${{ secrets.ECS_SERVICE }} \
+  #           --force-new-deployment

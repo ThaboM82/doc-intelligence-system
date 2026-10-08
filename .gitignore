@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local environment variables
+.env*.local
+
+# Next.js & Frontend Exclusions
+node_modules/
+.next/
+.vscode/
+

@@ -1,7 +1,8 @@
-from enum import Enum
-from typing import Dict, List, Optional, Any
-from pydantic import BaseModel, Field, HttpUrl
 from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, Field
 
 
 class DocumentType(str, Enum):
@@ -42,8 +43,8 @@ class ExtractedField(BaseModel):
     key: str = Field(..., description="Attribute or schema field name")
     value: Any = Field(..., description="Extracted value (str, int, float, list, etc.)")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Extraction confidence score")
-    page_number: Optional[int] = Field(default=None, description="Page number where key was found")
-    bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box on page")
+    page_number: int | None = Field(default=None, description="Page number where key was found")
+    bbox: BoundingBox | None = Field(default=None, description="Bounding box on page")
     requires_human_review: bool = Field(default=False, description="Flagged if confidence < threshold")
 
 
@@ -59,12 +60,12 @@ class TableCell(BaseModel):
 
 class TableData(BaseModel):
     """Structured representation of extracted tables."""
-    headers: List[str] = Field(default_factory=list)
-    rows: List[List[str]] = Field(default_factory=list)
-    cells: List[TableCell] = Field(default_factory=list, description="Cell-level layout mapping")
-    caption: Optional[str] = None
-    page_number: Optional[int] = None
-    bbox: Optional[BoundingBox] = None
+    headers: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+    cells: list[TableCell] = Field(default_factory=list, description="Cell-level layout mapping")
+    caption: str | None = None
+    page_number: int | None = None
+    bbox: BoundingBox | None = None
 
 
 class DocumentChunk(BaseModel):
@@ -74,19 +75,19 @@ class DocumentChunk(BaseModel):
     page_number: int = Field(..., description="Exact source page number (1-indexed)")
     content: str = Field(..., description="Text payload or markdown table representation")
     chunk_type: ChunkType = Field(default=ChunkType.TEXT, description="Type of layout element")
-    section_header: Optional[str] = Field(default=None, description="Enclosing heading/section title")
-    heading_level: Optional[int] = Field(default=None, description="H1, H2, H3 hierarchy level if applicable")
-    bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box on page for citation UI highlight")
-    token_count: Optional[int] = Field(default=None, description="Token length using model tokenizer")
-    embedding_id: Optional[str] = Field(default=None, description="Reference ID in Qdrant vector store")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Custom document attributes")
+    section_header: str | None = Field(default=None, description="Enclosing heading/section title")
+    heading_level: int | None = Field(default=None, description="H1, H2, H3 hierarchy level if applicable")
+    bbox: BoundingBox | None = Field(default=None, description="Bounding box on page for citation UI highlight")
+    token_count: int | None = Field(default=None, description="Token length using model tokenizer")
+    embedding_id: str | None = Field(default=None, description="Reference ID in Qdrant vector store")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Custom document attributes")
 
 
 class PageMetadata(BaseModel):
     """Page-level extraction details."""
     page_number: int
-    width: Optional[float] = Field(default=None, description="Page width in points/pixels")
-    height: Optional[float] = Field(default=None, description="Page height in points/pixels")
+    width: float | None = Field(default=None, description="Page width in points/pixels")
+    height: float | None = Field(default=None, description="Page height in points/pixels")
     text_length: int
     table_count: int = 0
     image_count: int = 0
@@ -100,7 +101,7 @@ class ExtractionAuditTrail(BaseModel):
     parser_name: str = Field(default="DoclingLayoutParser")
     model_name: str = Field(default="llama3.1:8b")
     processed_at: datetime = Field(default_factory=datetime.utcnow)
-    processing_time_ms: Optional[float] = None
+    processing_time_ms: float | None = None
 
 
 class ProcessedDocument(BaseModel):
@@ -109,21 +110,21 @@ class ProcessedDocument(BaseModel):
     filename: str
     file_type: DocumentType
     file_hash: str = Field(..., description="SHA256 checksum for deduplication")
-    file_size_bytes: Optional[int] = None
+    file_size_bytes: int | None = None
     page_count: int
     
     # Structural hierarchy
-    pages: List[PageMetadata] = Field(default_factory=list)
-    chunks: List[DocumentChunk] = Field(default_factory=list)
-    tables: List[TableData] = Field(default_factory=list)
+    pages: list[PageMetadata] = Field(default_factory=list)
+    chunks: list[DocumentChunk] = Field(default_factory=list)
+    tables: list[TableData] = Field(default_factory=list)
     
     # Key-value extraction with confidence tracking
-    extracted_fields: Dict[str, ExtractedField] = Field(default_factory=dict)
+    extracted_fields: dict[str, ExtractedField] = Field(default_factory=dict)
     
     # Quality & Governance
     overall_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     review_status: ReviewStatus = Field(default=ReviewStatus.AUTO_PASSED)
-    flagged_reasons: List[str] = Field(default_factory=list, description="Reasons triggering HITL review")
+    flagged_reasons: list[str] = Field(default_factory=list, description="Reasons triggering HITL review")
     
     audit: ExtractionAuditTrail = Field(default_factory=ExtractionAuditTrail)
     created_at: datetime = Field(default_factory=datetime.utcnow)
