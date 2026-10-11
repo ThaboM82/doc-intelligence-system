@@ -1,0 +1,42 @@
+﻿ACME CORP — INFORMATION SECURITY POLICY
+Document ID: POL-INFOSEC-2026-DR
+Title: Data Retention and Disposal
+Classification: Internal
+Effective: 2026-01-15
+Owner: Chief Information Security Officer
+
+1. PURPOSE
+This policy defines minimum and maximum retention periods for business records
+and the approved methods for secure disposal.
+
+2. SCOPE
+Applies to all employees, contractors, and systems that store ACME customer or
+employee data, including cloud object storage, databases, and the Document
+Intelligence platform.
+
+3. RETENTION PERIODS
+3.1 Customer account records: retained for seven (7) years after account closure
+    unless a shorter period is required by a written customer contract.
+3.2 Financial invoices and ledgers: retained for ten (10) years.
+3.3 Security incident logs: retained for three (3) years minimum; critical
+    incident packages retained for seven (7) years.
+3.4 Employee HR files: retained for seven (7) years after termination.
+3.5 Marketing analytics events: retained for twenty-four (24) months.
+
+4. LEGAL HOLD
+When Legal issues a litigation hold, automatic deletion is suspended for all
+in-scope records until the hold is released in writing.
+
+5. DISPOSAL
+5.1 Digital media must be wiped using approved cryptographic erasure or
+    physically destroyed via certified vendor.
+5.2 Paper records must be cross-cut shredded; certificates of destruction
+    retained for two (2) years.
+
+6. EXCEPTIONS
+Exceptions require written approval from CISO and Legal and must be logged
+in the compliance register within five (5) business days.
+
+7. ENFORCEMENT
+Violations may result in disciplinary action up to and including termination
+and, where applicable, regulatory notification.

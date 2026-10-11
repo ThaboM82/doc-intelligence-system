@@ -1,0 +1,37 @@
+﻿ACME CORP — ACCESS CONTROL STANDARD
+Document ID: POL-ACCESS-2026-MFA
+Title: Administrative Access and Multi-Factor Authentication
+Classification: Internal
+Effective: 2026-02-01
+Owner: Identity & Access Management
+
+1. PURPOSE
+Establish mandatory controls for privileged access to production systems,
+including API gateways, vector databases, and cloud consoles.
+
+2. ADMINISTRATIVE ACCESS
+2.1 Production administrative access requires:
+    (a) Named individual account (no shared logins);
+    (b) Multi-factor authentication (MFA) using phishing-resistant factors
+        where supported (hardware key or platform authenticator);
+    (c) Time-bound elevation via approved privileged access workflow.
+2.2 Service accounts must use short-lived tokens or workload identity;
+    long-lived static keys are prohibited except with CISO exception.
+
+3. API KEYS AND TELEMETRY
+3.1 ADMIN_API_KEY and equivalent secrets must be stored only in the platform
+    secret manager (e.g., Render environment variables), never in source control.
+3.2 Telemetry and quarantine list endpoints require valid administrative
+    credentials on every request.
+3.3 Keys must be rotated at least every ninety (90) days, or immediately
+    after suspected exposure.
+
+4. NETWORK AND ORIGIN CONTROLS
+4.1 Browser clients may only call the API from approved origins listed in
+    CORS_ORIGINS.
+4.2 Administrative actions from unexpected geolocations trigger step-up
+    verification.
+
+5. REVIEW
+Access reviews for privileged roles are conducted quarterly. Orphaned accounts
+must be disabled within forty-eight (48) hours of offboarding notification.

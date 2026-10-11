@@ -1,0 +1,9 @@
+﻿{
+  "status": "ok",
+  "uptime_seconds": 3600,
+  "total_requests": 42,
+  "qdrant_ok": true,
+  "collection_ready": true,
+  "memory_usage_mb": 256.0,
+  "cpu_percent": 12.5
+}

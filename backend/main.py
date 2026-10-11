@@ -1,14 +1,12 @@
 """
 backend/main.py
+Enterprise Document Intelligence & Security API
 
-Production FastAPI entrypoint for Document Intelligence System API.
-Startup lifecycle, telemetry, rate limiting, security headers,
-prompt-injection scanning, RAG search, document/quarantine management,
-and resilient LLMFactory integration.
+Production FastAPI backend entrypoint configured for vector RAG search, 
+document ingestion, threat telemetry, quarantine management, and resilient LLM integration.
 
 Deploy: Render (API) + Vercel (frontend). Qdrant via QDRANT_URL / QDRANT_API_KEY.
 """
-
 from __future__ import annotations
 
 import json
@@ -23,6 +21,18 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# Path bootstrap — MUST run before `backend.*` imports so that both
+# `uvicorn backend.main:app` and `python backend/main.py` work.
+# ---------------------------------------------------------------------------
+_file_path = Path(__file__).resolve()
+_backend_dir = _file_path.parent
+_workspace_root = _backend_dir.parent
+_cwd = Path.cwd()
+for _p in (_workspace_root, _backend_dir, _cwd):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 try:
     import psutil
@@ -68,30 +78,21 @@ from backend.routers.intelligence import (
     set_active_llm_factory,
 )
 
-# ------------------------------------------------------------------------------
-# Path bootstrap
-# ------------------------------------------------------------------------------
-_file_path = Path(__file__).resolve()
-_backend_dir = _file_path.parent
-_workspace_root = _backend_dir.parent
-_cwd = Path.cwd()
-for _p in (_workspace_root, _backend_dir, _cwd):
-    if _p.exists() and str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("document_intelligence_api")
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # State & config
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+API_VERSION = "1.3.0"
 system_start_time = time.time()
+
 request_metrics: dict[str, Any] = {
     "total_requests": 0,
     "successful_requests": 0,
@@ -100,14 +101,17 @@ request_metrics: dict[str, Any] = {
     "endpoint_hits": defaultdict(int),
     "status_code_counts": defaultdict(int),
 }
-rate_limit_tracker: dict[str, list[float]] = defaultdict(list)
 
+rate_limit_tracker: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+# Bound memory: idle client entries are purged when the tracker grows past this
+RATE_LIMIT_MAX_TRACKED_CLIENTS = int(os.getenv("RATE_LIMIT_MAX_TRACKED_CLIENTS", "5000"))
+
 API_KEY_HEADER = "X-API-Key"
 EXPECTED_ADMIN_KEY = os.getenv("ADMIN_API_KEY", "")
 
-# CORS: comma-separated origins (Vercel + local). Avoid bare "*" with credentials.
+# CORS: comma-separated origins (Vercel + local). Never combine "*" with credentials.
 _DEFAULT_CORS = (
     "http://localhost:5173,"
     "http://localhost:3000,"
@@ -118,6 +122,7 @@ CORS_ORIGINS = [
     for o in os.getenv("CORS_ORIGINS", _DEFAULT_CORS).split(",")
     if o.strip()
 ]
+_ALLOW_ALL_ORIGINS = "*" in CORS_ORIGINS
 
 
 async def verify_admin_access(
@@ -136,14 +141,14 @@ def _normalize_metric_path(path: str) -> str:
     return normalized
 
 
-# ------------------------------------------------------------------------------
-# Lifespan
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Lifespan — merged: Qdrant soft-fail + LLM factory init, graceful shutdown
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    logger.info("Initializing Document Intelligence System API services...")
+    logger.info("Initializing Document Intelligence & Security API services...")
 
-    # 1. Qdrant — soft-fail so Render still binds $PORT if vector DB is down
+    # 1. Qdrant — soft-fail so Render still binds $PORT if the vector DB is down
     qdrant_ok = await init_qdrant_collection(raise_on_error=False)
     if qdrant_ok:
         logger.info("Qdrant collection ready")
@@ -155,15 +160,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 2. LLM factory (optional if no API key / package)
     openai_key = os.getenv("OPENAI_API_KEY", "")
+    llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.1"))
     if ChatOpenAI is not None and openai_key:
         try:
             primary_llm = ChatOpenAI(
                 model=os.getenv("LLM_PRIMARY_MODEL", "gpt-4o"),
-                temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
+                temperature=llm_temperature,
             )
             fallback_llm = ChatOpenAI(
                 model=os.getenv("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
-                temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
+                temperature=llm_temperature,
             )
             factory = build_default_factory(
                 primary=primary_llm,
@@ -184,16 +190,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     await close_qdrant_client()
-    logger.info("Shutting down API services and releasing system resources.")
+    logger.info("Shut down API services and released system resources.")
 
 
+# ---------------------------------------------------------------------------
+# Application — SINGLE instance (was duplicated in the old file)
+# ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Document Intelligence System API",
+    title="Document Intelligence & Security API",
     description=(
-        "Production REST API for document processing, RAG vector retrieval, "
-        "security validation, prompt injection scanning, and document quarantining."
+        "Production REST API for document ingestion, Qdrant vector retrieval, "
+        "security validation, prompt injection scanning, RAG search, and "
+        "document quarantine management."
     ),
-    version="1.2.0",
+    version=API_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -202,13 +212,14 @@ app = FastAPI(
 
 app.include_router(intelligence_router)
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Middleware
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
+    allow_origins=["*"] if _ALLOW_ALL_ORIGINS else CORS_ORIGINS,
+    # CORS spec forbids "*" with credentials — mirror only when using explicit origins
+    allow_credentials=not _ALLOW_ALL_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["X-Request-ID", "X-Response-Time-MS"],
@@ -227,11 +238,20 @@ async def security_and_telemetry_middleware(request: Request, call_next):
         request.headers.get("x-forwarded-for", "").split(",")[0].strip()
         or (request.client.host if request.client else "127.0.0.1")
     )
+
+    # --- Sliding-window rate limit (memory-bounded) ---
     now = time.time()
-    rate_limit_tracker[client_ip] = [
-        t for t in rate_limit_tracker[client_ip] if now - t < RATE_LIMIT_WINDOW_SECONDS
+    hits = [
+        t for t in rate_limit_tracker[client_ip]
+        if now - t < RATE_LIMIT_WINDOW_SECONDS
     ]
-    if len(rate_limit_tracker[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
+    rate_limit_tracker[client_ip] = hits
+
+    if len(rate_limit_tracker) > RATE_LIMIT_MAX_TRACKED_CLIENTS:
+        for ip in [ip for ip, ts in rate_limit_tracker.items() if not ts]:
+            rate_limit_tracker.pop(ip, None)
+
+    if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={
@@ -285,48 +305,68 @@ async def security_and_telemetry_middleware(request: Request, call_next):
         )
 
 
-# ------------------------------------------------------------------------------
-# Optional module imports (security / ingestion / RAG)
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Optional module imports (security / intelligence / ingestion / RAG)
+# ---------------------------------------------------------------------------
+HeaderValidator = None
+PromptInjectionDetector = None
+intelligence_router = None
+ingestion_router = None
+pipeline = None
+security_router = None
+rag_router = None
+
 try:
-    from app.security.validators import HeaderValidator, PromptInjectionDetector
+    from app.security.validators import HeaderValidator, PromptInjectionDetector  # pyright: ignore[reportMissingImports]
 except ImportError:
     try:
-        from backend.security.validators import HeaderValidator, PromptInjectionDetector
+        from backend.security.validators import HeaderValidator, PromptInjectionDetector  # pyright: ignore[reportMissingImports]
     except ImportError:
-        HeaderValidator = None  # type: ignore[misc, assignment]
-        PromptInjectionDetector = None  # type: ignore[misc, assignment]
         logger.warning("Security validators could not be imported.")
 
 try:
-    from app.api.v1.ingestion import pipeline
-    from app.api.v1.ingestion import router as ingestion_router
+    from backend.routers.intelligence import router as intelligence_router
 except ImportError:
     try:
-        from backend.api.v1.ingestion import pipeline
-        from backend.api.v1.ingestion import router as ingestion_router
+        from app.routers.intelligence import router as intelligence_router
     except ImportError:
-        ingestion_router = None
-        pipeline = None
+        logger.warning("Intelligence router could not be imported.")
+
+try:
+    from backend.routers.ingestion import router as ingestion_router
+except ImportError:
+    try:
+        from backend.api.v1.ingestion import router as ingestion_router, pipeline
+    except ImportError:
         logger.warning("Ingestion module could not be imported.")
 
 try:
-    from app.api.routes.security import router as security_router
+    from app.api.routes.security import router as security_router  # pyright: ignore[reportMissingImports]
 except ImportError:
     try:
-        from backend.api.routes.security import router as security_router
+        from backend.routers.security import router as security_router  # pyright: ignore[reportMissingImports]
     except ImportError:
-        security_router = None
-        logger.warning("Security router could not be imported.")
+        try:
+            from backend.api.routes.security import router as security_router
+        except ImportError:
+            logger.warning("Security router could not be imported.")
 
 try:
-    from app.api.v1.rag import router as rag_router
+    from app.api.v1.rag import router as rag_router  # pyright: ignore[reportMissingImports]
 except ImportError:
     try:
-        from backend.api.v1.rag import router as rag_router
+        from backend.routers.rag import router as rag_router  # pyright: ignore[reportMissingImports]
     except ImportError:
-        rag_router = None
-        logger.warning("RAG router could not be imported.")
+        try:
+            from backend.api.v1.rag import router as rag_router
+        except ImportError:
+            logger.warning("RAG router could not be imported.")
+
+# ---------------------------------------------------------------------------
+# Router Inclusions
+# ---------------------------------------------------------------------------
+if intelligence_router is not None:
+    app.include_router(intelligence_router, prefix="/api/v1", tags=["Intelligence"])
 
 if ingestion_router is not None:
     app.include_router(ingestion_router, prefix="/api/v1/ingestion", tags=["Ingestion"])
@@ -343,10 +383,9 @@ if rag_router is not None:
     )
     logger.info("Registered RAG router at /api/v1/rag")
 
-
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Schemas
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 class SystemStatusResponse(BaseModel):
     status: str = Field(..., json_schema_extra={"example": "ok"})
     uptime_seconds: float = Field(..., json_schema_extra={"example": 3600.5})
@@ -417,9 +456,9 @@ class ScanPromptRequest(BaseModel):
     text: str
 
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Security response helpers
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _header_api_response(report: Any) -> dict[str, Any]:
     findings = list(getattr(report, "findings", None) or [])
     threats = [
@@ -474,9 +513,9 @@ def _prompt_api_response(report: Any) -> dict[str, Any]:
     }
 
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Security fallback routes
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 if security_router is None:
 
     @app.post("/api/v1/security/verify-headers", tags=["Security"])
@@ -588,14 +627,14 @@ if security_router is None:
     logger.info("Built-in security fallback routes registered at /api/v1/security/*")
 
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Core probes
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 @app.get("/", status_code=status.HTTP_200_OK)
 async def root():
     return {
-        "system": "Document Intelligence System API",
-        "version": "1.2.0",
+        "system": "Document Intelligence & Security API",
+        "version": API_VERSION,
         "status": "operational",
         "docs": "/docs",
         "redoc": "/redoc",
@@ -720,9 +759,9 @@ async def prometheus_metrics():
     return "\n".join(lines) + "\n"
 
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # RAG / documents fallbacks
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 if rag_router is None:
 
     @app.post(
@@ -794,15 +833,15 @@ async def list_quarantined_documents(_: None = Depends(verify_admin_access)):
     ]
 
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # OpenAPI + exception handlers
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
     openapi_schema = get_openapi(
-        title="Document Intelligence System API",
-        version="1.2.0",
+        title="Document Intelligence & Security API",
+        version=API_VERSION,
         description=(
             "Enterprise REST API for Document Parsing, RAG Vector Search, "
             "Header Authentication, and Indirect Prompt Injection Safeguards."

@@ -1,4 +1,5 @@
 import asyncio
+from importlib import import_module
 import logging
 from typing import Any
 
@@ -6,7 +7,7 @@ from pydantic import BaseModel, Field
 
 # --- Optional Provider Dependencies ---
 try:
-    from sentence_transformers import SentenceTransformer
+    SentenceTransformer: Any = import_module("sentence_transformers").SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
@@ -18,7 +19,7 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 try:
-    import cohere
+    cohere: Any = import_module("cohere")
     COHERE_AVAILABLE = True
 except ImportError:
     COHERE_AVAILABLE = False

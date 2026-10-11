@@ -227,3 +227,11 @@ node_modules/
 .next/
 .vscode/
 
+
+# backend/data runtime
+backend/data/uploads/**
+backend/data/cache/**
+backend/data/quarantine/**
+!backend/data/quarantine/.gitkeep
+!backend/data/uploads/.gitkeep
+!backend/data/cache/.gitkeep

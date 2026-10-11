@@ -1,0 +1,38 @@
+﻿[
+  {
+    "id": "q01",
+    "question": "How long are customer account records retained after account closure?",
+    "expected_answer_contains": ["seven", "7 years"],
+    "expected_source_doc": "POL-INFOSEC-2026-data-retention.txt"
+  },
+  {
+    "id": "q02",
+    "question": "What is the retention period for financial invoices and ledgers?",
+    "expected_answer_contains": ["ten", "10 years"],
+    "expected_source_doc": "POL-INFOSEC-2026-data-retention.txt"
+  },
+  {
+    "id": "q03",
+    "question": "How often must API keys be rotated?",
+    "expected_answer_contains": ["ninety", "90 days"],
+    "expected_source_doc": "POL-ACCESS-2026-admin-mfa.txt"
+  },
+  {
+    "id": "q04",
+    "question": "What is a Level 1 critical incident?",
+    "expected_answer_contains": ["vector", "exfiltration", "ransomware", "secret"],
+    "expected_source_doc": "RUN-SEC-2026-incident-response.txt"
+  },
+  {
+    "id": "q05",
+    "question": "What agreement is required before adopting a third-party AI vendor?",
+    "expected_answer_contains": ["DPA", "data processing agreement"],
+    "expected_source_doc": "STD-PROCURE-2026-vendor-risk.txt"
+  },
+  {
+    "id": "q06",
+    "question": "Within how many hours must a post-incident review be completed for Level 1 or 2?",
+    "expected_answer_contains": ["72", "seventy-two"],
+    "expected_source_doc": "RUN-SEC-2026-incident-response.txt"
+  }
+]

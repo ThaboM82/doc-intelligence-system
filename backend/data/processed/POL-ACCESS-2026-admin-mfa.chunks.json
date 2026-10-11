@@ -1,0 +1,14 @@
+﻿{
+  "doc_id": "POL-ACCESS-2026-MFA",
+  "source_file": "POL-ACCESS-2026-admin-mfa.txt",
+  "chunks": [
+    {
+      "chunk_id": "POL-ACCESS-2026-MFA-c01",
+      "text": "Production administrative access requires a named individual account, multi-factor authentication (MFA), and time-bound elevation."
+    },
+    {
+      "chunk_id": "POL-ACCESS-2026-MFA-c02",
+      "text": "Keys must be rotated at least every ninety (90) days, or immediately after suspected exposure. Secrets must never be stored in source control."
+    }
+  ]
+}

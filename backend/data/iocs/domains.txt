@@ -1,0 +1,2 @@
+﻿sso-auth-verify.com
+doc-intel-phishing-mirror.vercel.app

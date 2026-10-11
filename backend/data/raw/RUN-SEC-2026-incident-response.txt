@@ -1,0 +1,36 @@
+﻿ACME CORP — SECURITY OPERATIONS RUNBOOK
+Document ID: RUN-SEC-2026-IR
+Title: Incident Response — API, RAG, and Vector Store
+Classification: Internal — Restricted
+Effective: 2026-03-01
+Owner: Security Operations Center
+
+1. SEVERITY LEVELS (SUMMARY)
+Level 1 Critical: unauthorized production access, ransomware, unauthenticated
+vector database exfiltration, confirmed secret leak.
+Level 2 High: successful phishing against admins, API rate-limit abuse,
+JWT/API-key forgery attempts, prompt injection causing cross-tenant leakage.
+Level 3 Medium: bandwidth anomalies, CORS anomalies, single quarantine events.
+Level 4 Low: blocked scanners, rejected oversized uploads, noise.
+
+2. INITIAL CONTAINMENT (LEVEL 1–2)
+2.1 Revoke compromised sessions and rotate ADMIN_API_KEY / QDRANT_API_KEY /
+    provider keys as indicated by blast radius.
+2.2 Enforce WAF or platform IP blocks for abusive source ranges.
+2.3 Disable or throttle upload and RAG query routes if required.
+2.4 If vector exfiltration is suspected, freeze Qdrant API keys and place
+    the API in degraded mode until integrity is verified.
+
+3. ANALYSIS
+3.1 Correlate by request_id, X-Forwarded-For, tenant_id, and document_id.
+3.2 Use security dashboard scans and RAG log search for indicators of compromise.
+3.3 Preserve logs before rotation; prefer IDs over raw document content in tickets.
+
+4. RECOVERY
+4.1 Remove malicious Qdrant points; re-index clean corpus if poisoning occurred.
+4.2 Confirm /health reports qdrant_ok and collection_ready before full reopen.
+4.3 Complete post-incident review within seventy-two (72) hours for Level 1–2.
+
+5. ESCALATION
+Level 3: on-call engineer. Level 2: security lead within one hour.
+Level 1: security lead and executive sponsor immediately.

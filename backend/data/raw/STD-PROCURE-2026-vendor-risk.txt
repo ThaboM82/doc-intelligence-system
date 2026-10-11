@@ -1,0 +1,32 @@
+﻿ACME CORP — PROCUREMENT STANDARD
+Document ID: STD-PROCURE-2026-VR
+Title: Third-Party Vendor Risk for Cloud AI Services
+Classification: Internal
+Effective: 2026-01-20
+Owner: Procurement & Security
+
+1. PURPOSE
+Define due diligence requirements before adopting third-party AI, embedding,
+or vector database services that process ACME data.
+
+2. MINIMUM REQUIREMENTS
+2.1 Signed data processing agreement (DPA) addressing subprocessors.
+2.2 Encryption in transit (TLS 1.2+) and at rest for stored customer content.
+2.3 Documented retention and deletion procedures compatible with POL-INFOSEC-2026-DR.
+2.4 Support for API key rotation and least-privilege roles.
+2.5 Security incident notification to ACME within seventy-two (72) hours of
+    confirmed breach affecting ACME data.
+
+3. PROHIBITED USES
+3.1 Sending regulated health or payment card data to models without prior
+    Legal and CISO approval.
+3.2 Training public models on confidential ACME documents without contract
+    terms that prohibit provider training use.
+
+4. APPROVED CATEGORIES (EXAMPLES)
+- Hosted vector databases with VPC or IP allowlisting options
+- Enterprise LLM APIs with no-training contractual clauses
+- Document parsing services under active DPA
+
+5. REVIEW CADENCE
+Material vendors are reassessed annually or upon major product change.

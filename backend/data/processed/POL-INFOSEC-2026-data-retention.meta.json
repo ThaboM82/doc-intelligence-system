@@ -1,0 +1,7 @@
+﻿{
+  "doc_id": "POL-INFOSEC-2026-DR",
+  "source_file": "POL-INFOSEC-2026-data-retention.txt",
+  "title": "Data Retention and Disposal",
+  "chunk_count": 3,
+  "pipeline": "demo-processor-v1"
+}

@@ -1,0 +1,103 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1220" />
+    <meta
+      name="description"
+      content="Enterprise Document Intelligence & Threat Telemetry Platform — upload documents, secure RAG search, and real-time security scanning dashboards."
+    />
+    <meta name="color-scheme" content="dark" />
+
+    <!-- Mobile & PWA App Settings -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="DocIntelligence" />
+    <link rel="manifest" href="/manifest.json" />
+
+    <!-- Open Graph / Social Preview -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Document Intelligence & Security Platform" />
+    <meta
+      property="og:description"
+      content="Enterprise RAG search, threat telemetry, and document compliance scanning."
+    />
+    <meta property="og:locale" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Document Intelligence & Security Platform" />
+    <meta
+      name="twitter:description"
+      content="Upload documents, execute secure RAG vector queries, and monitor threat telemetry."
+    />
+
+    <!-- Google Fonts: Inter (UI) & JetBrains Mono (Logs & Telemetry IDs) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Favicons & Manifest -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.json" />
+
+    <title>Document Intelligence & Security</title>
+
+    <!-- FOUC Prevention & Initial Loading Spinner -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #0b1220;
+        color: #e2e8f0;
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      #root:empty::before {
+        content: '';
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 36px;
+        height: 36px;
+        margin: -18px 0 0 -18px;
+        border: 3px solid rgba(59, 130, 246, 0.2);
+        border-top-color: #3b82f6;
+        border-radius: 50%;
+        animation: doc-spin 0.8s linear infinite;
+      }
+      #root:empty::after {
+        content: 'Initializing Security Corpus & Vector Indices…';
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: 0.875rem;
+        color: #64748b;
+        letter-spacing: 0.025em;
+        padding-top: 60px;
+      }
+      @keyframes doc-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      <div style="padding: 3rem; font-family: 'Inter', system-ui, sans-serif; color: #e2e8f0; text-align: center;">
+        <h2 style="color: #f87171; margin-bottom: 0.5rem;">JavaScript Required</h2>
+        <p style="color: #94a3b8;">JavaScript is required to run the Document Intelligence & Security Platform.</p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

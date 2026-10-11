@@ -1,0 +1,18 @@
+﻿{
+  "doc_id": "POL-INFOSEC-2026-DR",
+  "source_file": "POL-INFOSEC-2026-data-retention.txt",
+  "chunks": [
+    {
+      "chunk_id": "POL-INFOSEC-2026-DR-c01",
+      "text": "Customer account records are retained for seven (7) years after account closure unless a shorter period is required by a written customer contract."
+    },
+    {
+      "chunk_id": "POL-INFOSEC-2026-DR-c02",
+      "text": "Financial invoices and ledgers are retained for ten (10) years. Security incident logs are retained for three (3) years minimum; critical incident packages retained for seven (7) years."
+    },
+    {
+      "chunk_id": "POL-INFOSEC-2026-DR-c03",
+      "text": "When Legal issues a litigation hold, automatic deletion is suspended for all in-scope records until the hold is released in writing."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+﻿{
+  "doc_id": "RUN-SEC-2026-IR",
+  "source_file": "RUN-SEC-2026-incident-response.txt",
+  "chunks": [
+    {
+      "chunk_id": "RUN-SEC-2026-IR-c01",
+      "text": "Level 1 Critical includes unauthorized production access, ransomware, unauthenticated vector database exfiltration, and confirmed secret leak."
+    },
+    {
+      "chunk_id": "RUN-SEC-2026-IR-c02",
+      "text": "Complete post-incident review within seventy-two (72) hours for Level 1-2. Level 1 escalates to security lead and executive sponsor immediately."
+    }
+  ]
+}

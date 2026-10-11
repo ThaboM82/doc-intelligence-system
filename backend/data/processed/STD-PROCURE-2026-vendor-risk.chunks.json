@@ -1,0 +1,14 @@
+﻿{
+  "doc_id": "STD-PROCURE-2026-VR",
+  "source_file": "STD-PROCURE-2026-vendor-risk.txt",
+  "chunks": [
+    {
+      "chunk_id": "STD-PROCURE-2026-VR-c01",
+      "text": "Minimum requirements include a signed data processing agreement (DPA). Security incident notification to ACME within seventy-two (72) hours of confirmed breach affecting ACME data."
+    },
+    {
+      "chunk_id": "STD-PROCURE-2026-VR-c02",
+      "text": "Training public models on confidential ACME documents without contract terms that prohibit provider training use is prohibited."
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "summary": {
+    "total": 6,
+    "passed": 1,
+    "failed": 5,
+    "errors": 0,
+    "accuracy": 0.1667,
+    "avg_hit_rate": 0.0833,
+    "source_checked": 6,
+    "source_matched": 0,
+    "avg_latency_ms": 0.0,
+    "by_difficulty": {
+      "unknown": {
+        "total": 6,
+        "passed": 1
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "q01",
+      "question": "How long are customer account records retained after account closure?",
+      "difficulty": "unknown",
+      "answer": "Synthesized response for query: 'How long are customer account records retained after account closure?' based on retrieved enterprise documents.",
+      "latency_ms": 0.0,
+      "passed": false,
+      "hits": [],
+      "hit_rate": 0.0,
+      "source_match": false,
+      "answer_len": 144,
+      "num_sources": 1
+    },
+    {
+      "id": "q02",
+      "question": "What is the retention period for financial invoices and ledgers?",
+      "difficulty": "unknown",
+      "answer": "Synthesized response for query: 'What is the retention period for financial invoices and ledgers?' based on retrieved enterprise documents.",
+      "latency_ms": 0.0,
+      "passed": true,
+      "hits": [
+        "ten"
+      ],
+      "hit_rate": 0.5,
+      "source_match": false,
+      "answer_len": 139,
+      "num_sources": 1
+    },
+    {
+      "id": "q03",
+      "question": "How often must API keys be rotated?",
+      "difficulty": "unknown",
+      "answer": "Synthesized response for query: 'How often must API keys be rotated?' based on retrieved enterprise documents.",
+      "latency_ms": 0.0,
+      "passed": false,
+      "hits": [],
+      "hit_rate": 0.0,
+      "source_match": false,
+      "answer_len": 110,
+      "num_sources": 1
+    },
+    {
+      "id": "q04",
+      "question": "What is a Level 1 critical incident?",
+      "difficulty": "unknown",
+      "answer": "Synthesized response for query: 'What is a Level 1 critical incident?' based on retrieved enterprise documents.",
+      "latency_ms": 0.0,
+      "passed": false,
+      "hits": [],
+      "hit_rate": 0.0,
+      "source_match": false,
+      "answer_len": 111,
+      "num_sources": 1
+    },
+    {
+      "id": "q05",
+      "question": "What agreement is required before adopting a third-party AI vendor?",
+      "difficulty": "unknown",
+      "answer": "Synthesized response for query: 'What agreement is required before adopting a third-party AI vendor?' based on retrieved enterprise documents.",
+      "latency_ms": 0.0,
+      "passed": false,
+      "hits": [],
+      "hit_rate": 0.0,
+      "source_match": false,
+      "answer_len": 142,
+      "num_sources": 1
+    },
+    {
+      "id": "q06",
+      "question": "Within how many hours must a post-incident review be completed for Level 1 or 2?",
+      "difficulty": "unknown",
+      "answer": "Synthesized response for query: 'Within how many hours must a post-incident review be completed for Level 1 or 2?' based on retrieved enterprise documents.",
+      "latency_ms": 0.0,
+      "passed": false,
+      "hits": [],
+      "hit_rate": 0.0,
+      "source_match": false,
+      "answer_len": 155,
+      "num_sources": 1
+    }
+  ]
+}

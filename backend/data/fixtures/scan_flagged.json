@@ -1,0 +1,9 @@
+﻿{
+  "filename": "suspicious.pdf",
+  "is_flagged": true,
+  "status": "quarantined",
+  "threats_detected": ["prompt_injection", "embedded_script"],
+  "risk_score": 0.87,
+  "injection": { "is_flagged": true, "severity": "high" },
+  "headers": null
+}
