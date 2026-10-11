@@ -3,20 +3,27 @@ Qdrant vector database client manager, collection initialization,
 and async search/upsert operations.
 
 Env vars:
-  QDRANT_URL           – e.g. http://localhost:6333 or https://xxx.cloud.qdrant.io:6333
-  QDRANT_API_KEY       – optional (required for Qdrant Cloud)
-  QDRANT_COLLECTION    – collection name (default: document_intelligence)
-  QDRANT_VECTOR_SIZE   – embedding dim (default: 1536)
-  QDRANT_TIMEOUT       – request timeout seconds (default: 15)
-  QDRANT_PREFER_GRPC   – "true"/"1" to prefer gRPC when available (default: false)
+  QDRANT_URL          – e.g. http://localhost:6333 or https://xxx.cloud.qdrant.io:6333
+  QDRANT_API_KEY      – optional (required for Qdrant Cloud)
+  QDRANT_COLLECTION   – collection name (default: document_intelligence)
+  QDRANT_VECTOR_SIZE  – embedding dim (default: 1536)
+  QDRANT_TIMEOUT      – request timeout seconds (default: 15)
+  QDRANT_PREFER_GRPC  – "true"/"1" to prefer gRPC when available (default: false)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from dotenv import load_dotenv
+
+# Explicitly load .env from the project root directory
+_root_dir = Path(__file__).resolve().parent.parent.parent
+_env_file = _root_dir / ".env"
+load_dotenv(dotenv_path=_env_file)
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
@@ -51,6 +58,7 @@ async def get_qdrant_client() -> AsyncQdrantClient:
             "url": QDRANT_URL,
             "timeout": QDRANT_TIMEOUT,
             "prefer_grpc": PREFER_GRPC,
+            "check_compatibility": False,  # Silences Qdrant Cloud version mismatch warnings
         }
         if QDRANT_API_KEY:
             kwargs["api_key"] = QDRANT_API_KEY
