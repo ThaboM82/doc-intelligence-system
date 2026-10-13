@@ -1,14 +1,13 @@
 """
 backend/main.py
+
 Enterprise Document Intelligence & Security API
-
-Production FastAPI backend entrypoint configured for vector RAG search, 
-document ingestion, threat telemetry, quarantine management, and resilient LLM integration.
-
-Deploy: Render (API) + Vercel (frontend). Qdrant via QDRANT_URL / QDRANT_API_KEY.
+Render (API) + Vercel (frontend). Qdrant via QDRANT_URL / QDRANT_API_KEY.
 """
+
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -23,8 +22,7 @@ from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Path bootstrap — MUST run before `backend.*` imports so that both
-# `uvicorn backend.main:app` and `python backend/main.py` work.
+# Path bootstrap
 # ---------------------------------------------------------------------------
 _file_path = Path(__file__).resolve()
 _backend_dir = _file_path.parent
@@ -59,13 +57,12 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-# Optional: only required if OPENAI_API_KEY is set
+# Optional LangChain OpenAI
 try:
     from langchain_openai import ChatOpenAI
 except ImportError:  # pragma: no cover
     ChatOpenAI = None  # type: ignore[misc, assignment]
 
-# --- Document Intelligence Backend Imports ---
 from backend.db.qdrant import (
     close_qdrant_client,
     health_check as qdrant_health_check,
@@ -73,14 +70,7 @@ from backend.db.qdrant import (
     is_collection_ready,
 )
 from backend.models.llm_factory import build_default_factory
-from backend.routers.intelligence import (
-    router as intelligence_router,
-    set_active_llm_factory,
-)
 
-# ---------------------------------------------------------------------------
-# Logging Configuration
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -88,9 +78,20 @@ logging.basicConfig(
 logger = logging.getLogger("document_intelligence_api")
 
 # ---------------------------------------------------------------------------
-# State & config
+# set_active_llm_factory (optional)
 # ---------------------------------------------------------------------------
-API_VERSION = "1.3.0"
+try:
+    from backend.routers.intelligence import set_active_llm_factory
+except ImportError:  # pragma: no cover
+
+    def set_active_llm_factory(_factory: Any) -> None:
+        logger.warning("set_active_llm_factory unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Config & state
+# ---------------------------------------------------------------------------
+API_VERSION = "1.3.1"
 system_start_time = time.time()
 
 request_metrics: dict[str, Any] = {
@@ -105,13 +106,11 @@ request_metrics: dict[str, Any] = {
 rate_limit_tracker: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
-# Bound memory: idle client entries are purged when the tracker grows past this
 RATE_LIMIT_MAX_TRACKED_CLIENTS = int(os.getenv("RATE_LIMIT_MAX_TRACKED_CLIENTS", "5000"))
 
 API_KEY_HEADER = "X-API-Key"
 EXPECTED_ADMIN_KEY = os.getenv("ADMIN_API_KEY", "")
 
-# CORS: comma-separated origins (Vercel + local). Never combine "*" with credentials.
 _DEFAULT_CORS = (
     "http://localhost:5173,"
     "http://localhost:3000,"
@@ -142,23 +141,21 @@ def _normalize_metric_path(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — merged: Qdrant soft-fail + LLM factory init, graceful shutdown
+# Lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Initializing Document Intelligence & Security API services...")
 
-    # 1. Qdrant — soft-fail so Render still binds $PORT if the vector DB is down
     qdrant_ok = await init_qdrant_collection(raise_on_error=False)
     if qdrant_ok:
         logger.info("Qdrant collection ready")
     else:
         logger.error(
             "Qdrant unavailable at startup — vector features degraded. "
-            "Set QDRANT_URL (and QDRANT_API_KEY for Cloud). Not using localhost on Render."
+            "Set QDRANT_URL (and QDRANT_API_KEY for Cloud)."
         )
 
-    # 2. LLM factory (optional if no API key / package)
     openai_key = os.getenv("OPENAI_API_KEY", "")
     llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.1"))
     if ChatOpenAI is not None and openai_key:
@@ -194,7 +191,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 # ---------------------------------------------------------------------------
-# Application — SINGLE instance (was duplicated in the old file)
+# App
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Document Intelligence & Security API",
@@ -210,15 +207,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.include_router(intelligence_router)
-
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if _ALLOW_ALL_ORIGINS else CORS_ORIGINS,
-    # CORS spec forbids "*" with credentials — mirror only when using explicit origins
     allow_credentials=not _ALLOW_ALL_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -233,16 +227,15 @@ async def security_and_telemetry_middleware(request: Request, call_next):
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
 
-    # Prefer proxy headers on Render / behind load balancers
     client_ip = (
         request.headers.get("x-forwarded-for", "").split(",")[0].strip()
         or (request.client.host if request.client else "127.0.0.1")
     )
 
-    # --- Sliding-window rate limit (memory-bounded) ---
     now = time.time()
     hits = [
-        t for t in rate_limit_tracker[client_ip]
+        t
+        for t in rate_limit_tracker[client_ip]
         if now - t < RATE_LIMIT_WINDOW_SECONDS
     ]
     rate_limit_tracker[client_ip] = hits
@@ -306,82 +299,92 @@ async def security_and_telemetry_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
-# Optional module imports (security / intelligence / ingestion / RAG)
+# Optional routers (import once; log full failures)
 # ---------------------------------------------------------------------------
 HeaderValidator = None
 PromptInjectionDetector = None
 intelligence_router = None
 ingestion_router = None
-pipeline = None
 security_router = None
 rag_router = None
+pipeline = None
 
-try:
-    from app.security.validators import HeaderValidator, PromptInjectionDetector  # pyright: ignore[reportMissingImports]
-except ImportError:
-    try:
-        from backend.security.validators import HeaderValidator, PromptInjectionDetector  # pyright: ignore[reportMissingImports]
-    except ImportError:
-        logger.warning("Security validators could not be imported.")
+
+def _load_security_validators():
+    for module_name in ("backend.security.validators", "app.security.validators"):
+        try:
+            module = importlib.import_module(module_name)
+            header_validator = getattr(module, "HeaderValidator", None)
+            prompt_detector = getattr(module, "PromptInjectionDetector", None)
+            if header_validator is not None or prompt_detector is not None:
+                return header_validator, prompt_detector
+        except Exception:
+            continue
+    logger.warning("Security validators could not be imported.")
+    return None, None
+
+
+HeaderValidator, PromptInjectionDetector = _load_security_validators()
 
 try:
     from backend.routers.intelligence import router as intelligence_router
 except ImportError:
+    logger.exception("Intelligence router could not be imported.")
+
+for _module_name in (
+    "backend.routers.ingestion",
+    "backend.api.routes.ingestion",
+    "app.routers.ingestion",
+):
     try:
-        from app.routers.intelligence import router as intelligence_router
+        ingestion_router = getattr(importlib.import_module(_module_name), "router", None)
+        if ingestion_router is not None:
+            break
     except ImportError:
-        logger.warning("Intelligence router could not be imported.")
+        continue
+if ingestion_router is None:
+    logger.warning("Ingestion module could not be imported.")
+
+for _module_name in (
+    "backend.routers.security",
+    "backend.api.routes.security",
+    "app.routers.security",
+):
+    try:
+        security_router = getattr(importlib.import_module(_module_name), "router", None)
+        if security_router is not None:
+            break
+    except ImportError:
+        continue
+if security_router is None:
+    logger.warning("Security router could not be imported.")
 
 try:
-    from backend.routers.ingestion import router as ingestion_router
-except ImportError:
-    try:
-        from backend.api.v1.ingestion import router as ingestion_router, pipeline
-    except ImportError:
-        logger.warning("Ingestion module could not be imported.")
+    from backend.routers.rag import router as rag_router
+except Exception:
+    logger.exception("RAG router could not be imported.")
 
-try:
-    from app.api.routes.security import router as security_router  # pyright: ignore[reportMissingImports]
-except ImportError:
-    try:
-        from backend.routers.security import router as security_router  # pyright: ignore[reportMissingImports]
-    except ImportError:
-        try:
-            from backend.api.routes.security import router as security_router
-        except ImportError:
-            logger.warning("Security router could not be imported.")
-
-try:
-    from app.api.v1.rag import router as rag_router  # pyright: ignore[reportMissingImports]
-except ImportError:
-    try:
-        from backend.routers.rag import router as rag_router  # pyright: ignore[reportMissingImports]
-    except ImportError:
-        try:
-            from backend.api.v1.rag import router as rag_router
-        except ImportError:
-            logger.warning("RAG router could not be imported.")
-
-# ---------------------------------------------------------------------------
-# Router Inclusions
-# ---------------------------------------------------------------------------
+# Mount once. Routers that already define prefix="/api/v1/..." get NO extra prefix.
 if intelligence_router is not None:
-    app.include_router(intelligence_router, prefix="/api/v1", tags=["Intelligence"])
+    app.include_router(intelligence_router)
+    logger.info("Registered intelligence router")
 
 if ingestion_router is not None:
-    app.include_router(ingestion_router, prefix="/api/v1/ingestion", tags=["Ingestion"])
+    app.include_router(ingestion_router)
+    logger.info("Registered ingestion router")
 
 if security_router is not None:
-    app.include_router(security_router, prefix="/api/v1/security", tags=["Security"])
-    logger.info("Registered security router at /api/v1/security")
+    app.include_router(security_router)
+    logger.info("Registered security router")
 else:
-    logger.warning("Security router missing — using built-in fallback routes.")
+    logger.warning("Security router missing — built-in fallback routes will apply.")
 
 if rag_router is not None:
-    app.include_router(
-        rag_router, prefix="/api/v1/rag", tags=["RAG Search & Intelligence"]
-    )
+    app.include_router(rag_router)
     logger.info("Registered RAG router at /api/v1/rag")
+else:
+    logger.warning("RAG router missing — stub /api/v1/rag/query fallback will apply.")
+
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -414,23 +417,16 @@ class TelemetryResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    query: str = Field(
-        ...,
-        json_schema_extra={
-            "example": "What are the compliance requirements for data retention?"
-        },
-    )
-    top_k: int = Field(5, ge=1, le=20, json_schema_extra={"example": 5})
-    filter_metadata: dict[str, Any] | None = Field(
-        None, json_schema_extra={"example": {"department": "legal"}}
-    )
+    query: str = Field(..., min_length=1, max_length=4000)
+    top_k: int = Field(5, ge=1, le=20)
+    filter_metadata: dict[str, Any] | None = None
 
 
 class QueryResponse(BaseModel):
     answer: str
-    sources: list[dict[str, Any]]
-    confidence_score: float
-    processing_time_ms: float
+    sources: list[dict[str, Any]] = []
+    confidence_score: float = 0.0
+    processing_time_ms: float = 0.0
 
 
 class DocumentUploadResponse(BaseModel):
@@ -514,7 +510,7 @@ def _prompt_api_response(report: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Security fallback routes
+# Security fallback routes (only if no security_router)
 # ---------------------------------------------------------------------------
 if security_router is None:
 
@@ -641,13 +637,13 @@ async def root():
         "health": "/health",
         "ready": "/ready",
         "metrics": "/metrics",
+        "rag": "/api/v1/rag/query",
         "security": "/api/v1/security",
     }
 
 
 @app.get("/health", response_model=SystemStatusResponse, status_code=status.HTTP_200_OK)
 async def health_check():
-    """Liveness for Render. Does not fail the process if Qdrant is down."""
     uptime = round(time.time() - system_start_time, 2)
     memory_mb = None
     cpu_usage = None
@@ -676,7 +672,6 @@ async def health_check():
 
 @app.get("/ready", response_model=ReadinessProbeResponse, status_code=status.HTTP_200_OK)
 async def readiness_check():
-    """Readiness: validators, pipeline, and Qdrant."""
     validators_ok = bool(PromptInjectionDetector and HeaderValidator)
     pipeline_ok = pipeline is not None
     qdrant = await qdrant_health_check()
@@ -697,6 +692,7 @@ async def readiness_check():
             "header_validator": "active" if HeaderValidator else "unavailable",
             "ingestion_pipeline": "active" if pipeline_ok else "unavailable",
             "security_router": "mounted" if security_router is not None else "fallback",
+            "rag_router": "mounted" if rag_router is not None else "fallback",
             "qdrant": qdrant,
         },
     )
@@ -760,7 +756,7 @@ async def prometheus_metrics():
 
 
 # ---------------------------------------------------------------------------
-# RAG / documents fallbacks
+# RAG fallback (only if rag_router failed to load)
 # ---------------------------------------------------------------------------
 if rag_router is None:
 
@@ -769,39 +765,45 @@ if rag_router is None:
         response_model=QueryResponse,
         tags=["RAG Search & Intelligence"],
     )
-    async def execute_rag_query(payload: QueryRequest):
+    async def execute_rag_query_fallback(payload: QueryRequest):
         start = time.time()
         duration = round((time.time() - start) * 1000, 2)
         return QueryResponse(
             answer=(
-                f"Synthesized response for query: '{payload.query}' "
-                "based on retrieved enterprise documents."
+                f"RAG module not loaded. Stub response for: '{payload.query}'. "
+                "Fix backend.routers.rag import and restart."
             ),
-            sources=[
-                {
-                    "id": "doc-001",
-                    "title": "Compliance Policy 2026",
-                    "similarity": 0.94,
-                }
-            ],
-            confidence_score=0.91,
+            sources=[],
+            confidence_score=0.0,
             processing_time_ms=duration,
         )
 
 
+# ---------------------------------------------------------------------------
+# Document routes (stubs until ingestion pipeline is wired)
+# ---------------------------------------------------------------------------
 @app.post(
     "/api/v1/documents/upload",
     response_model=DocumentUploadResponse,
     tags=["Document Management"],
 )
-async def upload_document(request: Request, background_tasks: BackgroundTasks):
+async def upload_document(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,  # type: ignore[assignment]
+):
     doc_id = str(uuid.uuid4())
+    filename = file.filename or "upload.bin"
+    # Drain body so client connections close cleanly
+    await file.read()
     return DocumentUploadResponse(
         document_id=doc_id,
-        filename="uploaded_document.pdf",
+        filename=filename,
         status="queued_for_ingestion",
         security_scan_passed=True,
-        message="Document successfully uploaded and passed initial security checks.",
+        message=(
+            "Document accepted. Full Docling/Qdrant ingestion pipeline not wired yet; "
+            "use seed_qdrant.py for corpus bootstrap."
+        ),
     )
 
 
@@ -813,7 +815,7 @@ async def upload_document(request: Request, background_tasks: BackgroundTasks):
 async def delete_document(document_id: str):
     return {
         "status": "success",
-        "message": f"Document {document_id} and its vector indices have been deleted.",
+        "message": f"Document {document_id} delete requested (stub).",
     }
 
 

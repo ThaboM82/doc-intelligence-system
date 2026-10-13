@@ -1,15 +1,60 @@
 ﻿{
   "name": "Doc Intelligence & Security Platform",
   "short_name": "DocIntelligence",
+  "description": "Enterprise RAG search, secure document ingestion, and threat telemetry dashboards.",
+  "lang": "en",
+  "dir": "ltr",
+  "id": "/",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["standalone", "browser"],
+  "orientation": "any",
   "background_color": "#0b1220",
   "theme_color": "#0b1220",
+  "categories": ["productivity", "business", "security"],
   "icons": [
     {
       "src": "/favicon.svg",
       "sizes": "any",
-      "type": "image/svg+xml"
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
     }
-  ]
+  ],
+  "shortcuts": [
+    {
+      "name": "RAG Chat",
+      "short_name": "Chat",
+      "description": "Ask questions over ingested documents",
+      "url": "/?tab=chat",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+    },
+    {
+      "name": "Upload Documents",
+      "short_name": "Upload",
+      "description": "Ingest files into the vector store",
+      "url": "/?tab=upload",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+    },
+    {
+      "name": "Security Dashboard",
+      "short_name": "Security",
+      "description": "Threat telemetry and health",
+      "url": "/?tab=security",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+    }
+  ],
+  "prefer_related_applications": false
 }

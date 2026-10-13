@@ -326,3 +326,29 @@ async def extract_structured_data(payload: ExtractRequest) -> dict[str, Any]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Extraction failed: {str(e)}"
         )
+
+
+@router.get("/health")
+async def intelligence_health_check() -> dict[str, Any]:
+    """
+    Health check endpoint to verify Qdrant Cloud connection,
+    collection status, and vector counts for the frontend telemetry widget.
+    """
+    try:
+        stats = await get_collection_stats()
+        return {
+            "status": "healthy",
+            "api": "online",
+            "vector_db": "connected",
+            "collection_status": "active",
+            "collection_stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "degraded",
+            "api": "online",
+            "vector_db": "error",
+            "collection_status": "unknown",
+            "error": str(e)
+        }

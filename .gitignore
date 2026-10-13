@@ -235,3 +235,8 @@ backend/data/quarantine/**
 !backend/data/quarantine/.gitkeep
 !backend/data/uploads/.gitkeep
 !backend/data/cache/.gitkeep
+
+.env
+*.env.local
+frontend/tsconfig.tsbuildinfo
+

@@ -4,19 +4,20 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b1220" />
+    <meta name="color-scheme" content="light dark" />
     <meta
       name="description"
       content="Enterprise Document Intelligence & Threat Telemetry Platform — upload documents, secure RAG search, and real-time security scanning dashboards."
     />
-    <meta name="color-scheme" content="dark" />
 
-    <!-- Mobile & PWA App Settings -->
+    <!-- Mobile / PWA -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="DocIntelligence" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <link rel="manifest" href="/manifest.json" />
 
-    <!-- Open Graph / Social Preview -->
+    <!-- Open Graph -->
     <meta property="og:type" content="website" />
     <meta property="og:title" content="Document Intelligence & Security Platform" />
     <meta
@@ -25,6 +26,7 @@
     />
     <meta property="og:locale" content="en_US" />
 
+    <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Document Intelligence & Security Platform" />
     <meta
@@ -32,7 +34,7 @@
       content="Upload documents, execute secure RAG vector queries, and monitor threat telemetry."
     />
 
-    <!-- Google Fonts: Inter (UI) & JetBrains Mono (Logs & Telemetry IDs) -->
+    <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -40,15 +42,14 @@
       rel="stylesheet"
     />
 
-    <!-- Favicons & Manifest -->
+    <!-- Icons -->
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="alternate icon" href="/favicon.ico" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="manifest" href="/manifest.json" />
 
     <title>Document Intelligence & Security</title>
 
-    <!-- FOUC Prevention & Initial Loading Spinner -->
+    <!-- FOUC + boot spinner -->
     <style>
       html,
       body {
@@ -59,6 +60,12 @@
         font-family: 'Inter', system-ui, -apple-system, sans-serif;
         -webkit-font-smoothing: antialiased;
       }
+
+      code,
+      .font-mono {
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
+      }
+
       #root:empty::before {
         content: '';
         position: absolute;
@@ -72,6 +79,7 @@
         border-radius: 50%;
         animation: doc-spin 0.8s linear infinite;
       }
+
       #root:empty::after {
         content: 'Initializing Security Corpus & Vector Indices…';
         display: grid;
@@ -83,9 +91,17 @@
         letter-spacing: 0.025em;
         padding-top: 60px;
       }
+
       @keyframes doc-spin {
         to {
           transform: rotate(360deg);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #root:empty::before {
+          animation: none;
+          border-top-color: #3b82f6;
         }
       }
     </style>
@@ -93,9 +109,18 @@
   <body>
     <div id="root"></div>
     <noscript>
-      <div style="padding: 3rem; font-family: 'Inter', system-ui, sans-serif; color: #e2e8f0; text-align: center;">
-        <h2 style="color: #f87171; margin-bottom: 0.5rem;">JavaScript Required</h2>
-        <p style="color: #94a3b8;">JavaScript is required to run the Document Intelligence & Security Platform.</p>
+      <div
+        style="
+          padding: 3rem;
+          font-family: Inter, system-ui, sans-serif;
+          color: #e2e8f0;
+          text-align: center;
+        "
+      >
+        <h2 style="color: #f87171; margin-bottom: 0.5rem">JavaScript Required</h2>
+        <p style="color: #94a3b8">
+          JavaScript is required to run the Document Intelligence &amp; Security Platform.
+        </p>
       </div>
     </noscript>
     <script type="module" src="/src/main.tsx"></script>

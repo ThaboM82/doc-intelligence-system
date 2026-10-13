@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useState } from 'react';
+﻿import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ShieldCheck,
   FileText,
@@ -11,14 +11,18 @@ import {
   WifiOff,
   Database,
   RefreshCw,
+  LayoutDashboard,
+  KeyRound,
+  LogOut,
 } from 'lucide-react';
 import DocumentUpload from './components/DocumentUpload';
 import RAGChat from './components/RAGChat';
 import SecurityDashboard from './components/SecurityDashboard';
+import AdminDashboard from './components/AdminDashboard';
 import apiClient from './lib/apiClient';
-import './App.css';
+import './index.css';
 
-type TabId = 'chat' | 'upload' | 'security';
+type TabId = 'chat' | 'upload' | 'security' | 'admin';
 
 type Notification = {
   message: string;
@@ -34,10 +38,45 @@ type HealthSnapshot = {
   reachable: boolean;
 };
 
+const VALID_TABS: TabId[] = ['chat', 'upload', 'security', 'admin'];
+const APP_VERSION = '0.2.0';
+const AUTH_TOKEN_KEY = 'doc_intel_access_token';
+
+function tabFromSearch(): TabId {
+  try {
+    const t = new URLSearchParams(window.location.search).get('tab');
+    if (t && VALID_TABS.includes(t as TabId)) return t as TabId;
+  } catch {
+    /* ignore */
+  }
+  return 'chat';
+}
+
+function setTabInUrl(tab: TabId) {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('tab', tab);
+    window.history.replaceState({}, '', url.toString());
+  } catch {
+    /* ignore */
+  }
+}
+
 const TABS: { id: TabId; label: string; short: string; icon: React.ReactNode }[] = [
   { id: 'chat', label: 'RAG Chat', short: 'Chat', icon: <MessageSquareText className="w-4 h-4" /> },
   { id: 'upload', label: 'Upload Docs', short: 'Upload', icon: <FileText className="w-4 h-4" /> },
-  { id: 'security', label: 'Security & Telemetry', short: 'Security', icon: <ShieldAlert className="w-4 h-4" /> },
+  {
+    id: 'security',
+    label: 'Security & Telemetry',
+    short: 'Security',
+    icon: <ShieldAlert className="w-4 h-4" />,
+  },
+  {
+    id: 'admin',
+    label: 'Admin',
+    short: 'Admin',
+    icon: <LayoutDashboard className="w-4 h-4" />,
+  },
 ];
 
 function formatUptime(sec?: number) {
@@ -50,11 +89,7 @@ function formatUptime(sec?: number) {
   return `${s}s`;
 }
 
-function StatusDot({
-  state,
-}: {
-  state: 'ok' | 'warn' | 'bad' | 'unknown';
-}) {
+function StatusDot({ state }: { state: 'ok' | 'warn' | 'bad' | 'unknown' }) {
   const color =
     state === 'ok'
       ? 'bg-emerald-500'
@@ -67,54 +102,100 @@ function StatusDot({
   return <span className={`w-2 h-2 rounded-full ${color} ${pulse}`} />;
 }
 
+function readStoredToken(): string {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<TabId>('chat');
+  const [activeTab, setActiveTab] = useState<TabId>(() => tabFromSearch());
   const [systemNotification, setSystemNotification] = useState<Notification | null>(null);
   const [health, setHealth] = useState<HealthSnapshot>({ reachable: false });
   const [healthLoading, setHealthLoading] = useState(true);
+  const [authToken, setAuthToken] = useState(readStoredToken);
+  const [tokenDraft, setTokenDraft] = useState(readStoredToken);
+  const [showAuthPanel, setShowAuthPanel] = useState(false);
+  const toastTimer = useRef<number | null>(null);
 
   const apiBase =
-    (typeof import.meta !== 'undefined' &&
-      (import.meta as ImportMeta & { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL) ||
-    (apiClient as { defaults?: { baseURL?: string }; baseURL?: string })?.defaults?.baseURL ||
-    (apiClient as { baseURL?: string })?.baseURL ||
-    'http://localhost:8000';
+    (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ||
+    (typeof apiClient.getBaseUrl === 'function' ? apiClient.getBaseUrl() : 'http://localhost:8000');
+
+  // Apply token to apiClient when present
+  useEffect(() => {
+    const client = apiClient as {
+      setAuthToken?: (t: string | null) => void;
+      defaults?: { headers?: Record<string, string> };
+    };
+    if (typeof client.setAuthToken === 'function') {
+      client.setAuthToken(authToken || null);
+    } else if (client.defaults?.headers) {
+      if (authToken) {
+        client.defaults.headers.Authorization = `Bearer ${authToken}`;
+      } else {
+        delete client.defaults.headers.Authorization;
+      }
+    }
+  }, [authToken]);
+
+  const selectTab = useCallback((tab: TabId) => {
+    setActiveTab(tab);
+    setTabInUrl(tab);
+  }, []);
 
   const triggerNotification = useCallback(
     (message: string, type: Notification['type'] = 'success') => {
       setSystemNotification({ message, type });
-      window.clearTimeout((triggerNotification as { _t?: number })._t);
-      (triggerNotification as { _t?: number })._t = window.setTimeout(() => {
+      if (toastTimer.current != null) {
+        window.clearTimeout(toastTimer.current);
+      }
+      toastTimer.current = window.setTimeout(() => {
         setSystemNotification(null);
+        toastTimer.current = null;
       }, 4500);
     },
     []
   );
 
+  const saveToken = () => {
+    const t = tokenDraft.trim();
+    setAuthToken(t);
+    try {
+      if (t) localStorage.setItem(AUTH_TOKEN_KEY, t);
+      else localStorage.removeItem(AUTH_TOKEN_KEY);
+    } catch {
+      /* ignore */
+    }
+    setShowAuthPanel(false);
+    triggerNotification(t ? 'API token saved for this browser.' : 'Token cleared.', 'info');
+  };
+
+  const clearToken = () => {
+    setAuthToken('');
+    setTokenDraft('');
+    try {
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+    } catch {
+      /* ignore */
+    }
+    triggerNotification('Signed out (token removed).', 'info');
+  };
+
   const refreshHealth = useCallback(async () => {
     setHealthLoading(true);
     try {
-      // Prefer axios-style client
-      let data: Record<string, unknown>;
-      if (typeof (apiClient as { get?: unknown }).get === 'function') {
-        const res = await (apiClient as { get: (url: string, cfg?: object) => Promise<{ data: Record<string, unknown> }> }).get(
-          '/health',
-          { timeout: 12_000 }
-        );
-        data = res.data;
-      } else if (typeof (apiClient as { getHealth?: unknown }).getHealth === 'function') {
-        data = (await (apiClient as { getHealth: () => Promise<Record<string, unknown>> }).getHealth()) as Record<string, unknown>;
-      } else {
-        const res = await fetch(`${String(apiBase).replace(/\/$/, '')}/health`);
-        data = await res.json();
-      }
-
+      const data = (await apiClient.getHealth()) as Record<string, unknown>;
       setHealth({
         status: String(data.status ?? 'unknown'),
         qdrant_ok: Boolean(data.qdrant_ok),
         collection_ready: Boolean(data.collection_ready),
-        uptime_seconds: typeof data.uptime_seconds === 'number' ? data.uptime_seconds : undefined,
-        total_requests: typeof data.total_requests === 'number' ? data.total_requests : undefined,
+        uptime_seconds:
+          typeof data.uptime_seconds === 'number' ? data.uptime_seconds : undefined,
+        total_requests:
+          typeof data.total_requests === 'number' ? data.total_requests : undefined,
         reachable: true,
       });
     } catch {
@@ -122,13 +203,22 @@ export default function App() {
     } finally {
       setHealthLoading(false);
     }
-  }, [apiBase]);
+  }, []);
 
   useEffect(() => {
     void refreshHealth();
     const id = window.setInterval(() => void refreshHealth(), 30_000);
-    return () => window.clearInterval(id);
+    return () => {
+      window.clearInterval(id);
+      if (toastTimer.current != null) window.clearTimeout(toastTimer.current);
+    };
   }, [refreshHealth]);
+
+  useEffect(() => {
+    const onPop = () => setActiveTab(tabFromSearch());
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
   const qdrantState: 'ok' | 'warn' | 'bad' | 'unknown' = !health.reachable
     ? 'bad'
@@ -148,10 +238,21 @@ export default function App() {
       : 'warn'
     : 'bad';
 
+  const shellDark = activeTab === 'security' || activeTab === 'admin';
+
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
-      {/* Top Navbar */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-50 shadow-xs">
+    <div
+      className={`min-h-screen flex flex-col font-sans transition-colors ${
+        shellDark ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'
+      }`}
+    >
+      <header
+        className={`sticky top-0 z-50 border-b ${
+          shellDark
+            ? 'bg-slate-900/90 border-slate-800 backdrop-blur'
+            : 'bg-white border-slate-200 shadow-xs'
+        }`}
+      >
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-3">
           <div className="flex items-center space-x-3 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-md shadow-blue-500/20 flex-shrink-0">
@@ -159,47 +260,113 @@ export default function App() {
             </div>
             <div className="min-w-0">
               <div className="flex items-center space-x-2">
-                <h1 className="font-bold text-slate-900 tracking-tight text-base sm:text-lg truncate">
+                <h1
+                  className={`font-bold tracking-tight text-base sm:text-lg truncate ${
+                    shellDark ? 'text-white' : 'text-slate-900'
+                  }`}
+                >
                   Doc Intelligence &amp; Security
                 </h1>
                 <span className="hidden sm:inline-block text-[10px] font-semibold bg-blue-50 text-blue-600 border border-blue-200 px-2 py-0.5 rounded-full">
-                  v0.1.2
+                  v{APP_VERSION}
                 </span>
               </div>
-              <p className="text-xs text-slate-500 truncate">
-                RAG · Docling · Threat detection
+              <p className={`text-xs truncate ${shellDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                RAG · Ingest · Threat detection · Admin
               </p>
             </div>
           </div>
 
-          <nav
-            className="flex items-center space-x-1 bg-slate-100 p-1 rounded-xl border border-slate-200/60"
-            role="tablist"
-            aria-label="Primary"
+          <div className="flex items-center gap-2">
+            <nav
+              className={`flex items-center space-x-1 p-1 rounded-xl border overflow-x-auto max-w-[55vw] sm:max-w-none ${
+                shellDark
+                  ? 'bg-slate-800/80 border-slate-700'
+                  : 'bg-slate-100 border-slate-200/60'
+              }`}
+              role="tablist"
+              aria-label="Primary"
+            >
+              {TABS.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === tab.id}
+                  onClick={() => selectTab(tab.id)}
+                  className={`flex items-center space-x-2 px-2.5 sm:px-3 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
+                    activeTab === tab.id
+                      ? shellDark
+                        ? 'bg-slate-700 text-blue-300 shadow-xs'
+                        : 'bg-white text-blue-600 shadow-xs'
+                      : shellDark
+                        ? 'text-slate-400 hover:text-white'
+                        : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {tab.icon}
+                  <span className="hidden md:inline">{tab.label}</span>
+                  <span className="md:hidden">{tab.short}</span>
+                </button>
+              ))}
+            </nav>
+
+            <button
+              type="button"
+              onClick={() => setShowAuthPanel((v) => !v)}
+              className={`p-2 rounded-xl border text-sm ${
+                shellDark
+                  ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                  : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+              } ${authToken ? 'ring-1 ring-emerald-500/40' : ''}`}
+              title="API bearer token"
+              aria-label="Auth token"
+            >
+              <KeyRound className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        {showAuthPanel && (
+          <div
+            className={`border-t px-4 sm:px-6 py-3 ${
+              shellDark ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'
+            }`}
           >
-            {TABS.map((tab) => (
+            <div className="max-w-7xl mx-auto flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+              <input
+                type="password"
+                value={tokenDraft}
+                onChange={(e) => setTokenDraft(e.target.value)}
+                placeholder="Paste JWT access_token from POST /api/v1/auth/login"
+                className={`flex-1 px-3 py-2 rounded-lg text-sm border ${
+                  shellDark
+                    ? 'bg-slate-950 border-slate-700 text-slate-100'
+                    : 'bg-white border-slate-200 text-slate-900'
+                }`}
+              />
               <button
-                key={tab.id}
                 type="button"
-                role="tab"
-                aria-selected={activeTab === tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`flex items-center space-x-2 px-3 sm:px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-                  activeTab === tab.id
-                    ? 'bg-white text-blue-600 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
+                onClick={saveToken}
+                className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-semibold"
+              >
+                Save token
+              </button>
+              <button
+                type="button"
+                onClick={clearToken}
+                className={`px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1 border ${
+                  shellDark ? 'border-slate-700 text-slate-300' : 'border-slate-200 text-slate-600'
                 }`}
               >
-                {tab.icon}
-                <span className="hidden sm:inline">{tab.label}</span>
-                <span className="sm:hidden">{tab.short}</span>
+                <LogOut className="w-3.5 h-3.5" />
+                Clear
               </button>
-            ))}
-          </nav>
-        </div>
+            </div>
+          </div>
+        )}
       </header>
 
-      {/* Toast */}
       {systemNotification && (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 w-full mt-4">
           <div
@@ -232,9 +399,10 @@ export default function App() {
           <div className="p-4 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-sm flex flex-wrap items-center justify-between gap-2">
             <span className="inline-flex items-center gap-2">
               <WifiOff className="w-4 h-4" />
-              Cannot reach API at <code className="text-xs bg-white/60 px-1 rounded">{apiBase}</code>.
-              Set <code className="text-xs">VITE_API_URL</code> (Vercel) and{' '}
-              <code className="text-xs">CORS_ORIGINS</code> (Render).
+              Cannot reach API at{' '}
+              <code className="text-xs bg-white/60 px-1 rounded">{apiBase}</code>. Set{' '}
+              <code className="text-xs">VITE_API_URL</code> and{' '}
+              <code className="text-xs">CORS_ORIGINS</code>.
             </span>
             <button
               type="button"
@@ -256,16 +424,16 @@ export default function App() {
                 <div>
                   <h2 className="text-xl font-bold text-slate-900">Document Q&amp;A Assistant</h2>
                   <p className="text-sm text-slate-500 mt-0.5">
-                    Query your Qdrant vector store via the LangChain retrieval pipeline.
+                    Query Qdrant via the RAG retrieval pipeline.
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setActiveTab('upload')}
+                  onClick={() => selectTab('upload')}
                   className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition-colors flex items-center space-x-1.5"
                 >
                   <FileText className="w-3.5 h-3.5" />
-                  <span>Ingest More Docs</span>
+                  <span>Ingest more docs</span>
                 </button>
               </div>
               <RAGChat />
@@ -275,17 +443,27 @@ export default function App() {
           {activeTab === 'upload' && (
             <div className="space-y-6">
               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
-                <h2 className="text-xl font-bold text-slate-900">Document Ingestion Pipeline</h2>
+                <h2 className="text-xl font-bold text-slate-900">Document ingestion</h2>
                 <p className="text-sm text-slate-500 mt-0.5">
-                  Upload → security scan → Docling layout parse → vectorize into Qdrant.
+                  Upload → security scan → chunk → embed → Qdrant.
                 </p>
               </div>
               <DocumentUpload
-                onUploadSuccess={() => {
-                  triggerNotification(
-                    'Document parsed, chunked, and synced to Qdrant.',
-                    'success'
-                  );
+                onUploadSuccess={(data?: { status?: string; message?: string }) => {
+                  const st = data?.status;
+                  if (st === 'quarantined') {
+                    triggerNotification(
+                      data?.message || 'Document quarantined by security scan.',
+                      'warn'
+                    );
+                  } else if (st === 'failed') {
+                    triggerNotification(data?.message || 'Ingest failed.', 'error');
+                  } else {
+                    triggerNotification(
+                      data?.message || 'Document indexed into Qdrant.',
+                      'success'
+                    );
+                  }
                   void refreshHealth();
                 }}
               />
@@ -293,29 +471,49 @@ export default function App() {
           )}
 
           {activeTab === 'security' && (
-            <div className="space-y-6">
-              <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
-                <h2 className="text-xl font-bold text-slate-900">Security Telemetry Dashboard</h2>
-                <p className="text-sm text-slate-500 mt-0.5">
-                  Policy checks, injection scans, and service health.
-                </p>
-              </div>
+            <div className="space-y-4">
               <SecurityDashboard />
+            </div>
+          )}
+
+          {activeTab === 'admin' && (
+            <div className="space-y-4">
+              {!authToken && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-100 text-sm px-4 py-3">
+                  Admin APIs need a JWT. Open the key icon, paste a token from{' '}
+                  <code className="text-xs">POST /api/v1/auth/login</code>, then refresh.
+                </div>
+              )}
+              <AdminDashboard />
             </div>
           )}
         </main>
 
         <aside className="space-y-6">
-          <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
+          <div
+            className={`p-6 rounded-2xl border shadow-xs space-y-4 ${
+              shellDark
+                ? 'bg-slate-900/80 border-slate-800 text-slate-100'
+                : 'bg-white border-slate-200'
+            }`}
+          >
             <div className="flex items-center justify-between">
-              <h3 className="font-semibold text-slate-900 text-sm flex items-center space-x-2">
+              <h3
+                className={`font-semibold text-sm flex items-center space-x-2 ${
+                  shellDark ? 'text-white' : 'text-slate-900'
+                }`}
+              >
                 <Activity className="w-4 h-4 text-blue-600" />
-                <span>Pipeline Health</span>
+                <span>Pipeline health</span>
               </h3>
               <button
                 type="button"
                 onClick={() => void refreshHealth()}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-50"
+                className={`p-1.5 rounded-lg ${
+                  shellDark
+                    ? 'text-slate-400 hover:text-white hover:bg-slate-800'
+                    : 'text-slate-400 hover:text-slate-700 hover:bg-slate-50'
+                }`}
                 title="Refresh"
                 aria-label="Refresh health"
               >
@@ -324,8 +522,16 @@ export default function App() {
             </div>
 
             <div className="space-y-3 text-xs">
-              <div className="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-100">
-                <span className="text-slate-600 font-medium inline-flex items-center gap-1.5">
+              <div
+                className={`flex items-center justify-between p-2.5 rounded-xl border ${
+                  shellDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-100'
+                }`}
+              >
+                <span
+                  className={`font-medium inline-flex items-center gap-1.5 ${
+                    shellDark ? 'text-slate-400' : 'text-slate-600'
+                  }`}
+                >
                   {health.reachable ? (
                     <Wifi className="w-3.5 h-3.5 text-slate-400" />
                   ) : (
@@ -333,38 +539,44 @@ export default function App() {
                   )}
                   API
                 </span>
-                <span className="flex items-center space-x-1 font-semibold text-slate-700">
+                <span className="flex items-center space-x-1 font-semibold">
                   <StatusDot state={apiState} />
                   <span>
-                    {healthLoading
-                      ? '…'
-                      : health.reachable
-                        ? health.status || 'online'
-                        : 'Down'}
+                    {healthLoading ? '…' : health.reachable ? health.status || 'online' : 'Down'}
                   </span>
                 </span>
               </div>
 
-              <div className="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-100">
-                <span className="text-slate-600 font-medium inline-flex items-center gap-1.5">
+              <div
+                className={`flex items-center justify-between p-2.5 rounded-xl border ${
+                  shellDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-100'
+                }`}
+              >
+                <span
+                  className={`font-medium inline-flex items-center gap-1.5 ${
+                    shellDark ? 'text-slate-400' : 'text-slate-600'
+                  }`}
+                >
                   <Database className="w-3.5 h-3.5 text-slate-400" />
-                  Vector DB (Qdrant)
+                  Vector DB
                 </span>
-                <span className="flex items-center space-x-1 font-semibold text-slate-700">
+                <span className="flex items-center space-x-1 font-semibold">
                   <StatusDot state={qdrantState} />
                   <span>
-                    {!health.reachable
-                      ? 'Unknown'
-                      : health.qdrant_ok
-                        ? 'Online'
-                        : 'Degraded'}
+                    {!health.reachable ? 'Unknown' : health.qdrant_ok ? 'Online' : 'Degraded'}
                   </span>
                 </span>
               </div>
 
-              <div className="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-100">
-                <span className="text-slate-600 font-medium">Collection</span>
-                <span className="flex items-center space-x-1 font-semibold text-slate-700">
+              <div
+                className={`flex items-center justify-between p-2.5 rounded-xl border ${
+                  shellDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-100'
+                }`}
+              >
+                <span className={shellDark ? 'text-slate-400 font-medium' : 'text-slate-600 font-medium'}>
+                  Collection
+                </span>
+                <span className="flex items-center space-x-1 font-semibold">
                   <StatusDot state={collectionState} />
                   <span>
                     {!health.reachable
@@ -376,30 +588,41 @@ export default function App() {
                 </span>
               </div>
 
-              <div className="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-100">
-                <span className="text-slate-600 font-medium">Uptime</span>
-                <span className="font-semibold text-slate-700">
-                  {formatUptime(health.uptime_seconds)}
+              <div
+                className={`flex items-center justify-between p-2.5 rounded-xl border ${
+                  shellDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-100'
+                }`}
+              >
+                <span className={shellDark ? 'text-slate-400 font-medium' : 'text-slate-600 font-medium'}>
+                  Uptime
                 </span>
+                <span className="font-semibold">{formatUptime(health.uptime_seconds)}</span>
               </div>
 
               {health.total_requests != null && (
-                <div className="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-100">
-                  <span className="text-slate-600 font-medium">Requests</span>
-                  <span className="font-semibold text-slate-700">{health.total_requests}</span>
+                <div
+                  className={`flex items-center justify-between p-2.5 rounded-xl border ${
+                    shellDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-100'
+                  }`}
+                >
+                  <span className={shellDark ? 'text-slate-400 font-medium' : 'text-slate-600 font-medium'}>
+                    Requests
+                  </span>
+                  <span className="font-semibold">{health.total_requests}</span>
                 </div>
               )}
             </div>
 
-            <p className="text-[10px] text-slate-400 break-all">
+            <p className={`text-[10px] break-all ${shellDark ? 'text-slate-500' : 'text-slate-400'}`}>
               API: <code>{apiBase}</code>
+              {authToken ? ' · token set' : ''}
             </p>
           </div>
 
           <div className="bg-gradient-to-br from-blue-900 to-slate-900 text-white p-6 rounded-2xl shadow-md space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="font-semibold text-sm tracking-wide text-blue-200 uppercase">
-                Architecture Stack
+                Architecture stack
               </h3>
               <Cpu className="w-5 h-5 text-blue-400" />
             </div>
@@ -414,7 +637,11 @@ export default function App() {
               </li>
               <li className="flex items-center space-x-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
-                <span>LangChain RAG pipeline</span>
+                <span>RAG + file security scan</span>
+              </li>
+              <li className="flex items-center space-x-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+                <span>Auth / RBAC · Admin ops</span>
               </li>
               <li className="flex items-center space-x-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
@@ -425,8 +652,14 @@ export default function App() {
         </aside>
       </div>
 
-      <footer className="bg-white border-t border-slate-200 py-4 text-center text-xs text-slate-400">
-        Doc Intelligence &amp; Security Suite &bull; FastAPI · Qdrant · Vercel
+      <footer
+        className={`border-t py-4 text-center text-xs ${
+          shellDark
+            ? 'bg-slate-900 border-slate-800 text-slate-500'
+            : 'bg-white border-slate-200 text-slate-400'
+        }`}
+      >
+        Doc Intelligence &amp; Security Suite &bull; FastAPI · Qdrant · Vercel · v{APP_VERSION}
       </footer>
     </div>
   );
