@@ -352,3 +352,105 @@ async def intelligence_health_check() -> dict[str, Any]:
             "collection_status": "unknown",
             "error": str(e)
         }
+
+except Exception as e:
+        logger.error(f"Structured extraction failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Extraction failed: {str(e)}"
+        )
+
+
+@router.get("/documents")
+async def list_documents() -> dict[str, Any]:
+    """
+    List ingested documents / points stored in the Qdrant collection 
+    for the frontend document management view.
+    """
+    try:
+        from backend.db.qdrant import get_qdrant_client, COLLECTION_NAME
+        client = get_qdrant_client()
+        
+        records, _ = client.scroll(
+            collection_name=COLLECTION_NAME,
+            with_payload=True,
+            with_vectors=False,
+            limit=50
+        )
+        
+        documents = []
+        for record in records:
+            payload = record.payload or {}
+            documents.append({
+                "id": record.id,
+                "filename": payload.get("filename", payload.get("title", "Unknown Document")),
+                "text_snippet": payload.get("text", "")[:150] + "...",
+                "metadata": payload
+            })
+            
+        return {
+            "status": "success",
+            "count": len(documents),
+            "documents": documents
+        }
+    except Exception as e:
+        logger.error(f"Failed to list documents: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch documents: {str(e)}"
+        )
+
+
+@router.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str) -> dict[str, Any]:
+    """
+    Delete a specific document chunk / point from the Qdrant collection by ID.
+    """
+    try:
+        from backend.db.qdrant import get_qdrant_client, COLLECTION_NAME
+        client = get_qdrant_client()
+        
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=models.PointIdsList(
+                points=[doc_id]
+            )
+        )
+        
+        logger.info(f"Successfully deleted document ID: {doc_id}")
+        return {
+            "status": "success",
+            "message": f"Document {doc_id} deleted successfully."
+        }
+    except Exception as e:
+        logger.error(f"Failed to delete document {doc_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete document: {str(e)}"
+        )
+
+
+@router.get("/health")
+async def intelligence_health_check() -> dict[str, Any]:
+    """
+    Health check endpoint to verify Qdrant Cloud connection, 
+    collection status, and vector counts for the frontend telemetry widget.
+    """
+    try:
+        stats = await get_collection_stats()
+        return {
+            "status": "healthy",
+            "api": "online",
+            "vector_db": "connected",
+            "collection_status": "active",
+            "collection_stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "degraded",
+            "api": "online",
+            "vector_db": "error",
+            "collection_status": "unknown",
+            "error": str(e)
+        }

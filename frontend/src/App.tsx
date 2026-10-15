@@ -19,6 +19,8 @@ import DocumentUpload from './components/DocumentUpload';
 import RAGChat from './components/RAGChat';
 import SecurityDashboard from './components/SecurityDashboard';
 import AdminDashboard from './components/AdminDashboard';
+import LoginForm from './components/LoginForm';
+import DocumentManager from './components/enterprise/DocumentManager'
 import apiClient from './lib/apiClient';
 import './index.css';
 
@@ -38,8 +40,17 @@ type HealthSnapshot = {
   reachable: boolean;
 };
 
+type UploadSuccessPayload = {
+  document_id?: string;
+  filename?: string;
+  status?: string;
+  message?: string;
+  chunks_upserted?: number;
+  security_scan_passed?: boolean;
+};
+
 const VALID_TABS: TabId[] = ['chat', 'upload', 'security', 'admin'];
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.2.2';
 const AUTH_TOKEN_KEY = 'doc_intel_access_token';
 
 function tabFromSearch(): TabId {
@@ -104,18 +115,38 @@ function StatusDot({ state }: { state: 'ok' | 'warn' | 'bad' | 'unknown' }) {
 
 function readStoredToken(): string {
   try {
-    return localStorage.getItem(AUTH_TOKEN_KEY) || '';
+    return (
+      localStorage.getItem(AUTH_TOKEN_KEY) ||
+      localStorage.getItem('auth_token') ||
+      localStorage.getItem('doc_intelligence_token') ||
+      ''
+    );
   } catch {
     return '';
   }
 }
 
+function applyClientToken(token: string | null) {
+  if (typeof apiClient.setAuthToken === 'function') {
+    apiClient.setAuthToken(token);
+    return;
+  }
+  const client = apiClient as {
+    defaults?: { headers?: Record<string, string> };
+  };
+  if (client.defaults?.headers) {
+    if (token) client.defaults.headers.Authorization = `Bearer ${token}`;
+    else delete client.defaults.headers.Authorization;
+  }
+}
+
 export default function App() {
+  const [authToken, setAuthToken] = useState(readStoredToken);
+  const [authed, setAuthed] = useState(() => Boolean(readStoredToken() || apiClient.getAuthToken?.()));
   const [activeTab, setActiveTab] = useState<TabId>(() => tabFromSearch());
   const [systemNotification, setSystemNotification] = useState<Notification | null>(null);
   const [health, setHealth] = useState<HealthSnapshot>({ reachable: false });
   const [healthLoading, setHealthLoading] = useState(true);
-  const [authToken, setAuthToken] = useState(readStoredToken);
   const [tokenDraft, setTokenDraft] = useState(readStoredToken);
   const [showAuthPanel, setShowAuthPanel] = useState(false);
   const toastTimer = useRef<number | null>(null);
@@ -124,21 +155,8 @@ export default function App() {
     (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ||
     (typeof apiClient.getBaseUrl === 'function' ? apiClient.getBaseUrl() : 'http://localhost:8000');
 
-  // Apply token to apiClient when present
   useEffect(() => {
-    const client = apiClient as {
-      setAuthToken?: (t: string | null) => void;
-      defaults?: { headers?: Record<string, string> };
-    };
-    if (typeof client.setAuthToken === 'function') {
-      client.setAuthToken(authToken || null);
-    } else if (client.defaults?.headers) {
-      if (authToken) {
-        client.defaults.headers.Authorization = `Bearer ${authToken}`;
-      } else {
-        delete client.defaults.headers.Authorization;
-      }
-    }
+    applyClientToken(authToken || null);
   }, [authToken]);
 
   const selectTab = useCallback((tab: TabId) => {
@@ -149,9 +167,7 @@ export default function App() {
   const triggerNotification = useCallback(
     (message: string, type: Notification['type'] = 'success') => {
       setSystemNotification({ message, type });
-      if (toastTimer.current != null) {
-        window.clearTimeout(toastTimer.current);
-      }
+      if (toastTimer.current != null) window.clearTimeout(toastTimer.current);
       toastTimer.current = window.setTimeout(() => {
         setSystemNotification(null);
         toastTimer.current = null;
@@ -160,28 +176,36 @@ export default function App() {
     []
   );
 
-  const saveToken = () => {
-    const t = tokenDraft.trim();
+  const persistToken = (t: string) => {
     setAuthToken(t);
+    setTokenDraft(t);
+    setAuthed(Boolean(t));
     try {
-      if (t) localStorage.setItem(AUTH_TOKEN_KEY, t);
-      else localStorage.removeItem(AUTH_TOKEN_KEY);
+      if (t) {
+        localStorage.setItem(AUTH_TOKEN_KEY, t);
+        localStorage.setItem('auth_token', t);
+      } else {
+        localStorage.removeItem(AUTH_TOKEN_KEY);
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('doc_intelligence_token');
+      }
     } catch {
       /* ignore */
     }
+    applyClientToken(t || null);
+  };
+
+  const saveToken = () => {
+    const t = tokenDraft.trim();
+    persistToken(t);
     setShowAuthPanel(false);
     triggerNotification(t ? 'API token saved for this browser.' : 'Token cleared.', 'info');
   };
 
-  const clearToken = () => {
-    setAuthToken('');
-    setTokenDraft('');
-    try {
-      localStorage.removeItem(AUTH_TOKEN_KEY);
-    } catch {
-      /* ignore */
-    }
-    triggerNotification('Signed out (token removed).', 'info');
+  const signOut = () => {
+    persistToken('');
+    setShowAuthPanel(false);
+    triggerNotification('Signed out.', 'info');
   };
 
   const refreshHealth = useCallback(async () => {
@@ -206,13 +230,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!authed) return;
     void refreshHealth();
     const id = window.setInterval(() => void refreshHealth(), 30_000);
     return () => {
       window.clearInterval(id);
       if (toastTimer.current != null) window.clearTimeout(toastTimer.current);
     };
-  }, [refreshHealth]);
+  }, [authed, refreshHealth]);
 
   useEffect(() => {
     const onPop = () => setActiveTab(tabFromSearch());
@@ -220,24 +245,75 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
+  const onUploadSuccess = (data?: UploadSuccessPayload) => {
+    // Notify DocumentManager / local library listeners
+    try {
+      if (data?.document_id && data?.filename) {
+        const key = 'doc_intel_library_v1';
+        const prev = JSON.parse(localStorage.getItem(key) || '[]') as unknown[];
+        const list = Array.isArray(prev) ? prev : [];
+        const next = [
+          {
+            document_id: data.document_id,
+            filename: data.filename,
+            status: data.status || 'unknown',
+            chunks_upserted: data.chunks_upserted,
+            security_scan_passed: data.security_scan_passed,
+            message: data.message,
+            uploaded_at: Date.now(),
+          },
+          ...list.filter(
+            (d) =>
+              (d as { document_id?: string }).document_id !== data.document_id
+          ),
+        ].slice(0, 50);
+        localStorage.setItem(key, JSON.stringify(next));
+        window.dispatchEvent(new Event('doc-library-updated'));
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const st = data?.status;
+    if (st === 'quarantined') {
+      triggerNotification(data?.message || 'Document quarantined by security scan.', 'warn');
+    } else if (st === 'failed') {
+      triggerNotification(data?.message || 'Ingest failed.', 'error');
+    } else {
+      triggerNotification(data?.message || 'Document indexed into Qdrant.', 'success');
+    }
+    void refreshHealth();
+  };
+
+  if (!authed) {
+    return (
+      <LoginForm
+        allowDemo
+        onLoginSuccess={(token?: string) => {
+          const t = token || readStoredToken() || 'session';
+          persistToken(t === 'demo_local_session' ? t : t);
+          setAuthed(true);
+          triggerNotification('Signed in.', 'success');
+        }}
+      />
+    );
+  }
+
   const qdrantState: 'ok' | 'warn' | 'bad' | 'unknown' = !health.reachable
     ? 'bad'
     : health.qdrant_ok
       ? 'ok'
       : 'warn';
-
   const collectionState: 'ok' | 'warn' | 'bad' | 'unknown' = !health.reachable
     ? 'bad'
     : health.collection_ready
       ? 'ok'
       : 'warn';
-
   const apiState: 'ok' | 'warn' | 'bad' | 'unknown' = health.reachable
     ? health.status === 'ok'
       ? 'ok'
       : 'warn'
     : 'bad';
-
   const shellDark = activeTab === 'security' || activeTab === 'admin';
 
   return (
@@ -324,6 +400,20 @@ export default function App() {
             >
               <KeyRound className="w-4 h-4" />
             </button>
+
+            <button
+              type="button"
+              onClick={signOut}
+              className={`p-2 rounded-xl border text-sm ${
+                shellDark
+                  ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                  : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+              }`}
+              title="Sign out"
+              aria-label="Sign out"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
           </div>
         </div>
 
@@ -354,13 +444,13 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={clearToken}
+                onClick={signOut}
                 className={`px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1 border ${
                   shellDark ? 'border-slate-700 text-slate-300' : 'border-slate-200 text-slate-600'
                 }`}
               >
                 <LogOut className="w-3.5 h-3.5" />
-                Clear
+                Clear / sign out
               </button>
             </div>
           </div>
@@ -448,25 +538,9 @@ export default function App() {
                   Upload → security scan → chunk → embed → Qdrant.
                 </p>
               </div>
-              <DocumentUpload
-                onUploadSuccess={(data?: { status?: string; message?: string }) => {
-                  const st = data?.status;
-                  if (st === 'quarantined') {
-                    triggerNotification(
-                      data?.message || 'Document quarantined by security scan.',
-                      'warn'
-                    );
-                  } else if (st === 'failed') {
-                    triggerNotification(data?.message || 'Ingest failed.', 'error');
-                  } else {
-                    triggerNotification(
-                      data?.message || 'Document indexed into Qdrant.',
-                      'success'
-                    );
-                  }
-                  void refreshHealth();
-                }}
-              />
+              <DocumentUpload onUploadSuccess={onUploadSuccess} />
+              {/* Single manager list — no separate DocumentLibrary */}
+              <DocumentManager />
             </div>
           )}
 

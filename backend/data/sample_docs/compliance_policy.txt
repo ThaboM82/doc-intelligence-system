@@ -1,10 +1,3 @@
-﻿# Sample compliance policy (demo corpus)
-
-## Data Retention
-Customer records are retained for 7 years unless a shorter period is required by contract.
-
-## Access Control
-Administrative access requires MFA and an approved API key for telemetry endpoints.
-
-## Incident Reporting
-Suspected breaches must be escalated to Security Operations within 1 hour of detection.
+Enterprise Data Retention Policy
+Employees must retain customer records for 7 years.
+Access to production databases requires MFA and admin approval.

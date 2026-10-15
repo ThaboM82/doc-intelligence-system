@@ -1,6 +1,6 @@
 """
 Qdrant vector database client manager, collection initialization,
-and async search/upsert operations.
+and async search/upsert/scroll/delete operations.
 
 Env vars:
   QDRANT_URL          – e.g. http://localhost:6333 or https://xxx.cloud.qdrant.io:6333
@@ -18,26 +18,29 @@ import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
 from dotenv import load_dotenv
 
-# Explicitly load .env from the project root directory
 _root_dir = Path(__file__).resolve().parent.parent.parent
 _env_file = _root_dir / ".env"
-load_dotenv(dotenv_path=_env_file)
+if _env_file.exists():
+    load_dotenv(dotenv_path=_env_file)
+else:
+    load_dotenv()
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
-from qdrant_client.http.exceptions import UnexpectedResponse, ResponseHandlingException
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333").rstrip("/")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
-COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "document_intelligence")
+COLLECTION_NAME = (
+    os.getenv("QDRANT_COLLECTION")
+    or os.getenv("QDRANT_COLLECTION_NAME")
+    or "document_intelligence"
+)
 VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", "1536"))
 QDRANT_TIMEOUT = float(os.getenv("QDRANT_TIMEOUT", "15"))
 PREFER_GRPC = os.getenv("QDRANT_PREFER_GRPC", "false").lower() in ("1", "true", "yes")
@@ -45,10 +48,6 @@ PREFER_GRPC = os.getenv("QDRANT_PREFER_GRPC", "false").lower() in ("1", "true", 
 _qdrant_client: AsyncQdrantClient | None = None
 _collection_ready: bool = False
 
-
-# ---------------------------------------------------------------------------
-# Client lifecycle
-# ---------------------------------------------------------------------------
 
 async def get_qdrant_client() -> AsyncQdrantClient:
     """Get or initialize the singleton AsyncQdrantClient instance."""
@@ -58,7 +57,7 @@ async def get_qdrant_client() -> AsyncQdrantClient:
             "url": QDRANT_URL,
             "timeout": QDRANT_TIMEOUT,
             "prefer_grpc": PREFER_GRPC,
-            "check_compatibility": False,  # Silences Qdrant Cloud version mismatch warnings
+            "check_compatibility": False,
         }
         if QDRANT_API_KEY:
             kwargs["api_key"] = QDRANT_API_KEY
@@ -88,19 +87,11 @@ async def close_qdrant_client() -> None:
 
 
 def is_collection_ready() -> bool:
-    """Whether init_qdrant_collection() succeeded at least once this process."""
     return _collection_ready
 
 
-# ---------------------------------------------------------------------------
-# Health / readiness
-# ---------------------------------------------------------------------------
-
 async def health_check(timeout: float | None = None) -> dict[str, Any]:
-    """
-    Lightweight connectivity check. Does not raise — returns status dict.
-    Useful for /health endpoints without crashing the process.
-    """
+    """Lightweight connectivity check — does not raise."""
     try:
         client = await get_qdrant_client()
         collections = await client.get_collections()
@@ -111,6 +102,8 @@ async def health_check(timeout: float | None = None) -> dict[str, Any]:
             "collections": names,
             "target_collection_exists": COLLECTION_NAME in names,
             "collection_ready": _collection_ready,
+            "collection_name": COLLECTION_NAME,
+            "vector_size": VECTOR_SIZE,
         }
     except Exception as e:
         logger.warning("Qdrant health_check failed: %s", e)
@@ -120,23 +113,35 @@ async def health_check(timeout: float | None = None) -> dict[str, Any]:
             "error": str(e),
             "error_type": type(e).__name__,
             "collection_ready": _collection_ready,
+            "collection_name": COLLECTION_NAME,
         }
 
 
-# ---------------------------------------------------------------------------
-# Collection init (soft-fail friendly)
-# ---------------------------------------------------------------------------
+async def _ensure_payload_indexes(client: AsyncQdrantClient) -> None:
+    """Create keyword indexes used by documents list/delete filters."""
+    for field_name in (
+        "document_id",
+        "doc_id",
+        "filename",
+        "file_name",
+        "status",
+        "department",
+    ):
+        try:
+            await client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name=field_name,
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:
+            # Index may already exist
+            logger.debug("Payload index %s: %s", field_name, e)
+
 
 async def init_qdrant_collection(*, raise_on_error: bool = True) -> bool:
     """
-    Ensure the Qdrant collection exists with cosine vectors of VECTOR_SIZE.
-
-    Args:
-        raise_on_error: If False, log and return False instead of raising
-                        (recommended for production lifespan so the API still boots).
-
-    Returns:
-        True if collection is ready, False if soft-failed.
+    Ensure collection exists with cosine vectors of VECTOR_SIZE.
+    Soft-fail when raise_on_error=False (recommended on Render lifespan).
     """
     global _collection_ready
 
@@ -173,9 +178,9 @@ async def init_qdrant_collection(*, raise_on_error: bool = True) -> bool:
                     )
             except Exception as e:
                 logger.debug("Could not verify collection vector size: %s", e)
-
             logger.info("Qdrant collection '%s' already exists.", COLLECTION_NAME)
 
+        await _ensure_payload_indexes(client)
         _collection_ready = True
         return True
 
@@ -193,16 +198,11 @@ async def init_qdrant_collection(*, raise_on_error: bool = True) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Upsert helpers
-# ---------------------------------------------------------------------------
-
 def build_point(
     vector: list[float],
     payload: dict[str, Any] | None = None,
     point_id: str | int | None = None,
 ) -> models.PointStruct:
-    """Build a PointStruct with optional auto-generated UUID id."""
     return models.PointStruct(
         id=point_id if point_id is not None else str(uuid4()),
         vector=vector,
@@ -211,7 +211,6 @@ def build_point(
 
 
 async def upsert_documents(points: list[models.PointStruct]) -> bool:
-    """Upsert document points (vectors + metadata payloads) into Qdrant."""
     if not points:
         logger.warning("upsert_documents called with empty points list")
         return True
@@ -236,10 +235,6 @@ async def upsert_texts(
     metadatas: list[dict[str, Any]] | None = None,
     ids: list[str | int] | None = None,
 ) -> bool:
-    """
-    Convenience wrapper: build points from parallel lists and upsert.
-    Lengths of texts, vectors, metadatas (if given), and ids (if given) must match.
-    """
     if len(texts) != len(vectors):
         raise ValueError("texts and vectors must have the same length")
     if metadatas is not None and len(metadatas) != len(texts):
@@ -257,10 +252,6 @@ async def upsert_texts(
     return await upsert_documents(points)
 
 
-# ---------------------------------------------------------------------------
-# Search
-# ---------------------------------------------------------------------------
-
 async def search_vectors(
     query_vector: list[float],
     top_k: int = 5,
@@ -269,16 +260,12 @@ async def search_vectors(
     with_payload: bool = True,
     with_vectors: bool = False,
 ) -> list[models.ScoredPoint]:
-    """Vector similarity search with optional payload filters and score threshold."""
     client = await get_qdrant_client()
 
     qdrant_filter = None
     if filter_conditions:
         must_conditions = [
-            models.FieldCondition(
-                key=k,
-                match=models.MatchValue(value=v),
-            )
+            models.FieldCondition(key=k, match=models.MatchValue(value=v))
             for k, v in filter_conditions.items()
         ]
         qdrant_filter = models.Filter(must=must_conditions)
@@ -299,18 +286,10 @@ async def search_vectors(
         raise
 
 
-# ---------------------------------------------------------------------------
-# Delete / scroll / stats
-# ---------------------------------------------------------------------------
-
 async def delete_points(
     point_ids: list[str | int] | None = None,
     filter_conditions: dict[str, Any] | None = None,
 ) -> bool:
-    """
-    Delete by point IDs and/or payload filter.
-    At least one of point_ids or filter_conditions must be provided.
-    """
     if not point_ids and not filter_conditions:
         raise ValueError("Provide point_ids and/or filter_conditions")
 
@@ -339,17 +318,24 @@ async def delete_points(
         raise
 
 
+async def delete_by_document_id(document_id: str) -> bool:
+    """Delete all points for a document (tries document_id then doc_id)."""
+    for key in ("document_id", "doc_id"):
+        try:
+            await delete_points(filter_conditions={key: document_id})
+            return True
+        except Exception as e:
+            logger.debug("delete_by_document_id key=%s failed: %s", key, e)
+    return False
+
+
 async def scroll_points(
     limit: int = 100,
     offset: str | int | None = None,
     filter_conditions: dict[str, Any] | None = None,
     with_payload: bool = True,
     with_vectors: bool = False,
-) -> tuple[list[models.Record], str | int | None]:
-    """
-    Scroll (paginate) points. Returns (records, next_offset).
-    next_offset is None when there are no more pages.
-    """
+) -> tuple[list[Any], str | int | None]:
     client = await get_qdrant_client()
 
     qdrant_filter = None
@@ -376,15 +362,14 @@ async def scroll_points(
 
 
 async def get_collection_stats() -> dict[str, Any]:
-    """Retrieve collection status and point count metrics for telemetry."""
     client = await get_qdrant_client()
     try:
         info = await client.get_collection(collection_name=COLLECTION_NAME)
         return {
             "status": str(info.status),
-            "vectors_count": info.vectors_count,
-            "points_count": info.points_count,
-            "indexed_vectors_count": info.indexed_vectors_count,
+            "vectors_count": getattr(info, "vectors_count", None),
+            "points_count": getattr(info, "points_count", None),
+            "indexed_vectors_count": getattr(info, "indexed_vectors_count", None),
             "collection_name": COLLECTION_NAME,
             "vector_size": VECTOR_SIZE,
         }
@@ -394,7 +379,6 @@ async def get_collection_stats() -> dict[str, Any]:
 
 
 async def count_points(filter_conditions: dict[str, Any] | None = None) -> int:
-    """Exact or filtered point count."""
     client = await get_qdrant_client()
     qdrant_filter = None
     if filter_conditions:
