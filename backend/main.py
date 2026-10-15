@@ -7,7 +7,7 @@ Render (API) + Vercel (frontend). Qdrant via QDRANT_URL / QDRANT_API_KEY.
 Integrates:
   - Soft-fail Qdrant + optional SQL init
   - LLMFactory (primary + fallback)
-  - Routers: intelligence, ingestion, security, rag, auth, admin
+  - Routers: intelligence, ingestion, documents, security, rag, auth, admin
   - Rate limit, security headers, telemetry middleware
   - /health /ready /metrics (+ optional core.telemetry)
 """
@@ -111,9 +111,9 @@ except ImportError:
     logger.info("core.telemetry not loaded — using in-process request_metrics only")
 
 # ---------------------------------------------------------------------------
-# Config & legacy request metrics (always available)
+# Config & legacy request metrics
 # ---------------------------------------------------------------------------
-API_VERSION = os.getenv("API_VERSION", "1.4.0")
+API_VERSION = os.getenv("API_VERSION", "1.5.0")
 system_start_time = time.time()
 
 request_metrics: dict[str, Any] = {
@@ -150,7 +150,6 @@ async def verify_admin_access(
     x_api_key: str | None = Header(None, alias=API_KEY_HEADER),
 ):
     if not EXPECTED_ADMIN_KEY:
-        # No key configured → allow (dev). Set ADMIN_API_KEY in production.
         return
     if x_api_key != EXPECTED_ADMIN_KEY:
         raise HTTPException(
@@ -172,7 +171,6 @@ def _normalize_metric_path(path: str) -> str:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Initializing Document Intelligence & Security API v%s ...", API_VERSION)
 
-    # SQL (users / docs metadata / audit) — soft-fail
     if _init_db is not None:
         try:
             await _init_db()
@@ -180,7 +178,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.error("SQL init failed (auth persistence degraded): %s", exc)
 
-    # Qdrant — soft-fail
     qdrant_ok = await init_qdrant_collection(raise_on_error=False)
     if qdrant_ok:
         logger.info("Qdrant collection ready")
@@ -190,7 +187,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "Set QDRANT_URL (and QDRANT_API_KEY for Cloud)."
         )
 
-    # LLM factory — soft-fail
     openai_key = os.getenv("OPENAI_API_KEY", "")
     llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.1"))
     if ChatOpenAI is not None and openai_key:
@@ -225,7 +221,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             await _close_db()
         except Exception as exc:
-            logger.warning("SQL close failed: %s", exp if False else exc)  # noqa: keep simple
+            logger.warning("SQL close failed: %s", exc)
     await close_qdrant_client()
     logger.info("Shut down API services and released resources.")
 
@@ -350,12 +346,13 @@ async def security_and_telemetry_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
-# Optional routers — import once; mount without double prefixes
+# Optional routers
 # ---------------------------------------------------------------------------
 HeaderValidator = None
 PromptInjectionDetector = None
 intelligence_router = None
 ingestion_router = None
+documents_router = None
 security_router = None
 rag_router = None
 auth_router = None
@@ -398,6 +395,11 @@ for _module_name in (
 if ingestion_router is None:
     logger.warning("Ingestion module could not be imported — upload stub will apply.")
 
+try:
+    from backend.routers.documents import router as documents_router
+except Exception:
+    logger.warning("Documents router could not be imported.")
+
 for _module_name in (
     "backend.routers.security",
     "backend.api.routes.security",
@@ -427,7 +429,6 @@ try:
 except Exception:
     logger.warning("Admin router could not be imported.")
 
-# Mount once (routers already carry /api/v1/... prefixes where needed)
 if intelligence_router is not None:
     app.include_router(intelligence_router)
     logger.info("Registered intelligence router")
@@ -435,6 +436,10 @@ if intelligence_router is not None:
 if ingestion_router is not None:
     app.include_router(ingestion_router)
     logger.info("Registered ingestion router")
+
+if documents_router is not None:
+    app.include_router(documents_router)
+    logger.info("Registered documents router at /api/v1/documents")
 
 if security_router is not None:
     app.include_router(security_router)
@@ -630,7 +635,6 @@ if security_router is None:
         file: UploadFile = File(...),
         headers_json: str | None = Form(None),
     ):
-        # Prefer file_scanner when available
         try:
             from backend.security.file_scanner import scan_upload
 
@@ -684,6 +688,11 @@ if security_router is None:
                 detail=f"Error executing security scan: {exc}",
             ) from exc
 
+        inj = _prompt_api_response(injection)
+        threats = list(inj.get("threats_detected") or [])
+        flagged = not inj.get("passed", True)
+        risk = float(inj.get("risk_score") or 0.0)
+
         header_report = None
         if headers and HeaderValidator is not None:
             try:
@@ -693,11 +702,6 @@ if security_router is None:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Failed to parse or validate email headers: {exc}",
                 ) from exc
-
-        inj = _prompt_api_response(injection)
-        threats = list(inj.get("threats_detected") or [])
-        flagged = not inj.get("passed", True)
-        risk = float(inj.get("risk_score") or 0.0)
 
         if header_report is not None:
             hdr = _header_api_response(header_report)
@@ -738,6 +742,7 @@ async def root():
         "admin": "/api/v1/admin",
         "security": "/api/v1/security",
         "upload": "/api/v1/documents/upload",
+        "documents": "/api/v1/documents",
     }
 
 
@@ -776,7 +781,9 @@ async def readiness_check():
     qdrant = await qdrant_health_check()
     qdrant_ok = bool(qdrant.get("ok")) and is_collection_ready()
 
-    status_str = "ready" if (qdrant_ok and (rag_router is not None or True)) else "degraded"
+    core_ok = qdrant_ok and (rag_router is not None or ingestion_router is not None)
+    status_str = "ready" if core_ok else "degraded"
+
     return ReadinessProbeResponse(
         status=status_str,
         validators_ready=validators_ok,
@@ -788,6 +795,8 @@ async def readiness_check():
             ),
             "header_validator": "active" if HeaderValidator else "unavailable",
             "ingestion_pipeline": "active" if pipeline_ok else "unavailable",
+            "ingestion_router": "mounted" if ingestion_router is not None else "stub",
+            "documents_router": "mounted" if documents_router is not None else "missing",
             "security_router": "mounted" if security_router is not None else "fallback",
             "rag_router": "mounted" if rag_router is not None else "fallback",
             "auth_router": "mounted" if auth_router is not None else "missing",
@@ -799,7 +808,6 @@ async def readiness_check():
 
 @app.get("/telemetry", response_model=TelemetryResponse, status_code=status.HTTP_200_OK)
 async def get_telemetry_legacy(_: None = Depends(verify_admin_access)):
-    """HTTP request metrics (admin key). Prefer /api/v1/admin/telemetry/summary when admin router is live."""
     avg_latency = 0.0
     if request_metrics["total_requests"] > 0:
         avg_latency = round(
@@ -864,7 +872,7 @@ async def prometheus_metrics():
 
 
 # ---------------------------------------------------------------------------
-# RAG fallback (only if rag_router failed to load)
+# RAG fallback
 # ---------------------------------------------------------------------------
 if rag_router is None:
 
@@ -888,7 +896,7 @@ if rag_router is None:
 
 
 # ---------------------------------------------------------------------------
-# Document routes — stubs ONLY when ingestion_router is missing
+# Document stubs (only when real routers missing)
 # ---------------------------------------------------------------------------
 if ingestion_router is None:
 
@@ -917,6 +925,9 @@ if ingestion_router is None:
             warnings=["ingestion_router_not_loaded"],
         )
 
+
+if documents_router is None and ingestion_router is None:
+
     @app.delete(
         "/api/v1/documents/{document_id}",
         status_code=status.HTTP_200_OK,
@@ -935,7 +946,6 @@ if ingestion_router is None:
     tags=["Document Management"],
 )
 async def list_quarantined_documents(_: None = Depends(verify_admin_access)):
-    # Placeholder list — replace with DB quarantine query when wired
     return [
         QuarantineItem(
             document_id="q-doc-999",

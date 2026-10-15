@@ -66,7 +66,9 @@ def _safe_filename(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def extract_text_with_pages(filename: str, raw: bytes) -> tuple[str, list[tuple[int, str]]]:
+def extract_text_with_pages(
+    filename: str, raw: bytes
+) -> tuple[str, list[tuple[int, str]]]:
     """
     Returns (full_text, [(page_number, page_text), ...]).
     page_number is 1-based when known; single (0, text) for non-paged formats.
@@ -95,7 +97,7 @@ def extract_text_with_pages(filename: str, raw: bytes) -> tuple[str, list[tuple[
             text = raw.decode("utf-8", errors="replace")
             return text, [(0, text)]
 
-    if name.endswith(".docx"):
+    if name.endswith((".docx", ".doc")):
         try:
             import io
 
@@ -167,9 +169,55 @@ def chunk_pages(
             out.append((ch, page_no if page_no > 0 else None))
     if out:
         return out
-    # fallback: whole doc
     full = "\n\n".join(t for _, t in pages if t)
     return [(c, None) for c in chunk_text(full, size=size, overlap=overlap)]
+
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+
+
+def _run_security_scan(
+    filename: str, raw: bytes, text_sample: str
+) -> tuple[bool, list[str]]:
+    """
+    Returns (passed, warnings).
+    Tries file_scanner first, then PromptInjectionDetector.
+    """
+    warnings: list[str] = []
+
+    try:
+        from backend.security.file_scanner import scan_upload
+
+        report = scan_upload(filename, raw, text_sample)
+        blocked = bool(
+            getattr(report, "blocked", False)
+            or getattr(report, "is_flagged", False)
+        )
+        findings = getattr(report, "findings", None) or getattr(
+            report, "matched_patterns", None
+        )
+        if findings:
+            warnings.extend(str(f) for f in list(findings)[:15])
+        if blocked:
+            return False, warnings
+        return True, warnings
+    except Exception as exc:
+        logger.debug("file_scanner unavailable: %s", exc)
+
+    try:
+        from backend.security.validators import PromptInjectionDetector
+
+        report = PromptInjectionDetector.scan_text(text_sample[:80_000])
+        if getattr(report, "is_flagged", False):
+            patterns = list(getattr(report, "matched_patterns", None) or [])
+            warnings.extend(str(p) for p in patterns[:15])
+            return False, warnings
+    except Exception as exc:
+        warnings.append(f"Security scan skipped: {exc}")
+
+    return True, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -178,15 +226,24 @@ def chunk_pages(
 
 
 async def _embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch-friendly embedding via embed_query (OpenAI path)."""
-    from backend.services.embeddings import embed_query
+    """Prefer embeddings.embed_texts; fall back to embed_query / OpenAI batch."""
+    try:
+        from backend.services.embeddings import embed_texts
 
-    # Try OpenAI batch API if available for speed
+        return await embed_texts(texts)
+    except Exception as exc:
+        logger.debug("embed_texts unavailable: %s", exc)
+
+    try:
+        from backend.services.embeddings import embed_query
+    except Exception as exc:
+        raise RuntimeError(f"No embedding backend available: {exc}") from exc
+
     if os.getenv("OPENAI_API_KEY") and len(texts) > 1:
         try:
             return await _openai_embed_batch(texts)
-        except Exception as exc:
-            logger.warning("Batch embed failed, falling back per-chunk: %s", exc)
+        except Exception as batch_exc:
+            logger.warning("Batch embed failed, per-chunk fallback: %s", batch_exc)
 
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
@@ -197,8 +254,6 @@ async def _embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 async def _openai_embed_batch(texts: list[str]) -> list[list[float]]:
-    import asyncio
-
     from openai import OpenAI
 
     model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
@@ -206,7 +261,6 @@ async def _openai_embed_batch(texts: list[str]) -> list[list[float]]:
     def _run(batch: list[str]) -> list[list[float]]:
         client = OpenAI()
         res = client.embeddings.create(input=batch, model=model)
-        # API returns in order
         return [list(item.embedding) for item in res.data]
 
     all_vecs: list[list[float]] = []
@@ -221,6 +275,8 @@ async def _upsert_chunks(
     filename: str,
     chunk_rows: list[tuple[str, int | None]],
     vectors: list[list[float]],
+    *,
+    security_ok: bool,
     extra_payload: dict[str, Any] | None = None,
 ) -> int:
     from qdrant_client.http import models
@@ -231,21 +287,31 @@ async def _upsert_chunks(
         raise ValueError("chunks/vectors length mismatch")
 
     client = await get_qdrant_client()
+    now = time.time()
     points = []
     base_payload = dict(extra_payload or {})
 
     for i, ((text, page), vec) in enumerate(zip(chunk_rows, vectors)):
+        # Keys used by documents.py list/group/delete AND rag_service
         payload: dict[str, Any] = {
             **base_payload,
+            "document_id": doc_id,
             "doc_id": doc_id,
             "chunk_id": f"{doc_id}:{i}",
             "source_file": filename,
             "file_name": filename,
+            "filename": filename,
             "text": text,
             "chunk_index": i,
+            "status": "indexed",
+            "security_scan_passed": security_ok,
+            "uploaded_at": now,
+            "ingested_at": now,
         }
         if page is not None:
             payload["page"] = page
+            payload["page_number"] = page
+
         points.append(
             models.PointStruct(
                 id=_point_id(doc_id, i),
@@ -264,29 +330,36 @@ async def _upsert_chunks(
 
 
 async def delete_document_vectors(doc_id: str) -> int:
-    """Remove all points for a document (filter on payload doc_id)."""
+    """Remove all points for a document (filter on document_id / doc_id)."""
     from qdrant_client.http import models
 
     from backend.db.qdrant import get_qdrant_client
 
     client = await get_qdrant_client()
-    await client.delete(
-        collection_name=COLLECTION,
-        points_selector=models.FilterSelector(
-            filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="doc_id",
-                        match=models.MatchValue(value=doc_id),
+    for key in ("document_id", "doc_id"):
+        try:
+            await client.delete(
+                collection_name=COLLECTION,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchValue(value=doc_id),
+                            )
+                        ]
                     )
-                ]
+                ),
             )
-        ),
-    )
-    return 0  # Qdrant delete does not always return count
+            return 0
+        except Exception as exc:
+            logger.debug("delete by %s failed: %s", key, exc)
+    return 0
 
 
-def _save_bytes(directory: Path, doc_id: str, filename: str, raw: bytes) -> Path | None:
+def _save_bytes(
+    directory: Path, doc_id: str, filename: str, raw: bytes
+) -> Path | None:
     try:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{doc_id}_{filename}"
@@ -315,32 +388,24 @@ async def ingest_bytes(
     warnings: list[str] = []
     safe_name = _safe_filename(filename)
 
-    # --- Security scan ---
+    sample = raw[:80_000].decode("utf-8", errors="replace")
     security_ok = True
     if not skip_security:
-        try:
-            from backend.security.validators import PromptInjectionDetector
+        security_ok, scan_warnings = _run_security_scan(safe_name, raw, sample)
+        warnings.extend(scan_warnings)
+        if not security_ok:
+            _save_bytes(QUARANTINE_DIR, doc_id, safe_name, raw)
+            ms = round((time.perf_counter() - t0) * 1000, 2)
+            return IngestResult(
+                document_id=doc_id,
+                filename=safe_name,
+                status="quarantined",
+                security_scan_passed=False,
+                message="Document flagged by security scan; not indexed.",
+                warnings=warnings,
+                processing_time_ms=ms,
+            )
 
-            sample = raw[:80_000].decode("utf-8", errors="replace")
-            report = PromptInjectionDetector.scan_text(sample)
-            if getattr(report, "is_flagged", False):
-                security_ok = False
-                _save_bytes(QUARANTINE_DIR, doc_id, safe_name, raw)
-                patterns = list(getattr(report, "matched_patterns", None) or [])
-                ms = round((time.perf_counter() - t0) * 1000, 2)
-                return IngestResult(
-                    document_id=doc_id,
-                    filename=safe_name,
-                    status="quarantined",
-                    security_scan_passed=False,
-                    message="Document flagged by security scan; not indexed.",
-                    warnings=patterns,
-                    processing_time_ms=ms,
-                )
-        except Exception as exc:
-            warnings.append(f"Security scan skipped: {exc}")
-
-    # --- Extract ---
     full_text, pages = extract_text_with_pages(safe_name, raw)
     if len(full_text) > MAX_INGEST_CHARS:
         full_text = full_text[:MAX_INGEST_CHARS]
@@ -376,13 +441,17 @@ async def ingest_bytes(
     _save_bytes(UPLOAD_DIR, doc_id, safe_name, raw)
 
     extra = dict(metadata or {})
-    extra.setdefault("ingested_at", time.time())
 
     try:
         texts = [c[0] for c in chunk_rows]
         vectors = await _embed_texts(texts)
         n = await _upsert_chunks(
-            doc_id, safe_name, chunk_rows, vectors, extra_payload=extra
+            doc_id,
+            safe_name,
+            chunk_rows,
+            vectors,
+            security_ok=security_ok,
+            extra_payload=extra,
         )
     except Exception as exc:
         logger.exception("Ingest upsert failed")
