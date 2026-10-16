@@ -1,0 +1,36 @@
+name: eval-baseline
+
+# Nightly: refresh the baseline on main so PR gates compare against current
+# production behavior, not a stale snapshot.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install httpx
+      - name: Run evals on main
+        env:
+          API_BASE: ${{ secrets.EVAL_API_BASE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python -m backend.evaluation.harness \
+            --require-source --min-hit-rate 0.5 \
+            --out backend/data/eval_set/baseline.json
+      - name: Commit refreshed baseline
+        run: |
+          git config user.name "eval-bot"
+          git config user.email "eval-bot@users.noreply.github.com"
+          git add backend/data/eval_set/baseline.json
+          git commit -m "chore: refresh eval baseline [skip ci]" || echo "no changes"
+          git push

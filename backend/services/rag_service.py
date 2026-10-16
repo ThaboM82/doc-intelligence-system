@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.services.embeddings import embed_query
+from backend.observability.cost import chat_cost
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,19 @@ def _openai_chat_sync(query: str, context: str) -> str:
             },
         ],
     )
+    
+    # Track chat token costs via observability tracker
+    if hasattr(completion, "usage") and completion.usage:
+        try:
+            chat_cost(
+                model=LLM_MODEL,
+                prompt_tokens=completion.usage.prompt_tokens,
+                completion_tokens=completion.usage.completion_tokens,
+                route="/api/v1/chat/rag"
+            )
+        except Exception:
+            pass
+
     return (completion.choices[0].message.content or "").strip()
 
 

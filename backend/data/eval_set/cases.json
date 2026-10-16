@@ -1,0 +1,16 @@
+[
+  {
+    "id": "case_001",
+    "query": "What is the document retention policy?",
+    "difficulty": "easy",
+    "must_include": ["retention"],
+    "expect_sources": true
+  },
+  {
+    "id": "case_002",
+    "query": "How do we handle phishing incidents?",
+    "difficulty": "medium",
+    "must_include": ["phishing"],
+    "expect_sources": true
+  }
+]

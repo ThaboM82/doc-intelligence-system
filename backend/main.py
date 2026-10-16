@@ -10,6 +10,7 @@ Integrates:
   - Routers: intelligence, ingestion, documents, security, rag, auth, admin
   - Rate limit, security headers, telemetry middleware
   - /health /ready /metrics (+ optional core.telemetry)
+  - rag_* Prometheus metrics via backend.observability (Project 3)
 """
 
 from __future__ import annotations
@@ -63,6 +64,10 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from backend.api.v1.alerts import router as alert_router
+
+
+app.include_router(alert_router)
 
 try:
     from langchain_openai import ChatOpenAI
@@ -109,6 +114,21 @@ try:
     from backend.core.telemetry import get_telemetry as _get_telemetry
 except ImportError:
     logger.info("core.telemetry not loaded — using in-process request_metrics only")
+
+# ---------------------------------------------------------------------------
+# Prometheus client metrics (rag_* histograms/counters) — optional soft-fail
+# ---------------------------------------------------------------------------
+_generate_latest = None
+try:
+    from prometheus_client import generate_latest
+
+    import backend.observability.metrics  # noqa: F401 — registers rag_* collectors
+    _generate_latest = generate_latest
+except ImportError:
+    logger.info(
+        "prometheus-client not installed — rag_* metrics unavailable. "
+        "Run: pip install prometheus-client"
+    )
 
 # ---------------------------------------------------------------------------
 # Config & legacy request metrics
@@ -215,6 +235,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "Skipping LLM Factory — ChatOpenAI unavailable or OPENAI_API_KEY not set"
         )
 
+    try:
+        from backend.observability.tracing import tracing_enabled
+
+        logger.info(
+            "LangSmith tracing: %s",
+            "enabled" if tracing_enabled() else "disabled (set LANGSMITH_TRACING=true)",
+        )
+    except Exception:
+        pass
+
     yield
 
     if _close_db is not None:
@@ -255,6 +285,21 @@ app.add_middleware(
     expose_headers=["X-Request-ID", "X-Response-Time-MS"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+@app.get("/metrics", tags=["Observability"])
+async def metrics() -> Response:
+    """
+    Expose Prometheus metrics for scraping.
+    """
+    body, ctype = metrics_payload()
+    return Response(body, media_type=ctype)
+
+app.include_router(intelligence_router)
+app.include_router(alerts_router)
+
+@app.get("/")
+async def root():
+    return {"status": "online", "system": "Document Intelligence API"}
 
 
 @app.middleware("http")
@@ -867,6 +912,10 @@ async def prometheus_metrics():
             lines.append(_get_telemetry().prometheus_lines().rstrip())
         except Exception:
             pass
+
+    # Append rag_* histograms/counters registered by backend.observability.metrics
+    if _generate_latest is not None:
+        lines.append(_generate_latest().decode("utf-8").rstrip())
 
     return "\n".join(lines) + "\n"
 

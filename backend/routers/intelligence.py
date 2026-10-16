@@ -9,13 +9,15 @@ import logging
 import uuid
 from typing import Any, AsyncGenerator
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from qdrant_client.http import models
 
 from backend.db.qdrant import get_collection_stats, search_vectors, upsert_documents
 from backend.models.llm_factory import LLMFactory
+from backend.security.validators import verify_bearer_token, require_editor_or_admin
+from backend.observability.cost import estimate_rag_cost, assert_cost_under, chat_cost
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/intelligence", tags=["Document Intelligence"])
@@ -76,18 +78,19 @@ class ExtractRequest(BaseModel):
 
 # --- Endpoints ---
 
-@router.post("/upload", status_code=status.HTTP_201_CREATED)
-async def upload_document_file(file: UploadFile = File(...)) -> dict[str, Any]:
+@router.post("/upload", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_editor_or_admin)])
+async def upload_document_file(
+    file: UploadFile = File(...),
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> dict[str, Any]:
     """
-    Direct multipart file upload endpoint for the React frontend DocumentUpload component.
-    Handles raw document intake, parsing, and vectorization staging.
+    Direct multipart file upload endpoint. Restricted to Editors and Admins.
     """
     try:
         file_bytes = await file.read()
         filename = file.filename or "unknown_file"
         
-        # In production: run Docling parser on file_bytes here, compute embeddings, and upsert into Qdrant.
-        logger.info(f"Received file upload: {filename} ({len(file_bytes)} bytes)")
+        logger.info(f"Received file upload from [{user.get('sub')}]: {filename} ({len(file_bytes)} bytes)")
         
         return {
             "status": "success",
@@ -103,15 +106,26 @@ async def upload_document_file(file: UploadFile = File(...)) -> dict[str, Any]:
 
 
 @router.post("/chat")
-async def chat_with_documents(payload: ChatRequest) -> dict[str, Any]:
+async def chat_with_documents(
+    payload: ChatRequest,
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> dict[str, Any]:
     """
-    Simplified chat endpoint tailored for the frontend RAGChat component.
-    Retrieves relevant documents and generates an LLM answer with source citations.
+    Simplified chat endpoint with cost tracking and token guardrails.
     """
     factory = get_llm_factory()
+    
+    # 1. Cost estimation & guardrail check
+    estimated_cost = estimate_rag_cost(prompt=payload.query, estimated_tokens=1000)
     try:
-        # Fallback query vector (or compute via embedding model if query_vector is omitted)
-        # For full implementation, generate embedding for payload.query here if needed.
+        assert_cost_under(estimated_cost, max_usd=0.05)
+    except AssertionError as err:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Cost guardrail triggered: {err}"
+        )
+
+    try:
         messages = [
             {"role": "system", "content": "You are a helpful document intelligence assistant."},
             {"role": "user", "content": payload.query}
@@ -119,6 +133,18 @@ async def chat_with_documents(payload: ChatRequest) -> dict[str, Any]:
         
         response = await factory.invoke(messages)
         answer_text = getattr(response, "content", str(response))
+
+        # Record chat usage cost
+        if hasattr(response, "usage") and response.usage:
+            try:
+                chat_cost(
+                    model="gpt-4o-mini",
+                    prompt_tokens=response.usage.prompt_tokens,
+                    completion_tokens=response.usage.completion_tokens,
+                    route="/api/v1/intelligence/chat"
+                )
+            except Exception:
+                pass
 
         return {
             "answer": answer_text,
@@ -134,9 +160,12 @@ async def chat_with_documents(payload: ChatRequest) -> dict[str, Any]:
         )
 
 
-@router.post("/ingest", status_code=status.HTTP_201_CREATED)
-async def ingest_documents(payload: IngestRequest) -> dict[str, Any]:
-    """Ingest pre-chunked document records and embedding vectors into Qdrant."""
+@router.post("/ingest", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_editor_or_admin)])
+async def ingest_documents(
+    payload: IngestRequest,
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> dict[str, Any]:
+    """Ingest pre-chunked document records into Qdrant. Restricted to Editors/Admins."""
     try:
         points = [
             models.PointStruct(
@@ -150,7 +179,7 @@ async def ingest_documents(payload: IngestRequest) -> dict[str, Any]:
         await upsert_documents(points)
         stats = await get_collection_stats()
 
-        logger.info(f"Successfully ingested {len(points)} document chunks.")
+        logger.info(f"Successfully ingested {len(points)} document chunks by [{user.get('sub')}].")
         return {
             "status": "success",
             "ingested_count": len(points),
@@ -165,15 +194,26 @@ async def ingest_documents(payload: IngestRequest) -> dict[str, Any]:
 
 
 @router.post("/query", response_model=QueryResponse)
-async def query_intelligence(payload: QueryRequest) -> QueryResponse:
+async def query_intelligence(
+    payload: QueryRequest,
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> QueryResponse:
     """
-    Perform a full RAG query: retrieve relevant document context from Qdrant
-    and synthesize an answer using the resilient LLMFactory.
+    Perform a full RAG query with pre-flight cost guardrails and token verification.
     """
     factory = get_llm_factory()
 
+    # Pre-flight cost verification
+    estimated_cost = estimate_rag_cost(prompt=payload.query, estimated_tokens=1500)
     try:
-        # If no query_vector provided, provide a default zero-vector or handle gracefully
+        assert_cost_under(estimated_cost, max_usd=0.05)
+    except AssertionError as err:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Cost guardrail triggered: {err}"
+        )
+
+    try:
         q_vector = payload.query_vector or [0.0] * 1536 
 
         scored_points = await search_vectors(
@@ -238,7 +278,10 @@ async def query_intelligence(payload: QueryRequest) -> QueryResponse:
 
 
 @router.post("/query/stream")
-async def query_intelligence_stream(payload: QueryRequest) -> StreamingResponse:
+async def query_intelligence_stream(
+    payload: QueryRequest,
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> StreamingResponse:
     """
     Perform a streaming RAG query, returning chunks incrementally as Server-Sent Events (SSE).
     """
@@ -291,10 +334,12 @@ async def query_intelligence_stream(payload: QueryRequest) -> StreamingResponse:
 
 
 @router.post("/extract")
-async def extract_structured_data(payload: ExtractRequest) -> dict[str, Any]:
+async def extract_structured_data(
+    payload: ExtractRequest,
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> dict[str, Any]:
     """
-    Extract structured metadata from unstructured text using Pydantic schema validation
-    via the LLMFactory structured output pipeline.
+    Extract structured metadata from unstructured text using Pydantic schema validation.
     """
     factory = get_llm_factory()
 
@@ -328,44 +373,12 @@ async def extract_structured_data(payload: ExtractRequest) -> dict[str, Any]:
         )
 
 
-@router.get("/health")
-async def intelligence_health_check() -> dict[str, Any]:
-    """
-    Health check endpoint to verify Qdrant Cloud connection,
-    collection status, and vector counts for the frontend telemetry widget.
-    """
-    try:
-        stats = await get_collection_stats()
-        return {
-            "status": "healthy",
-            "api": "online",
-            "vector_db": "connected",
-            "collection_status": "active",
-            "collection_stats": stats
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return {
-            "status": "degraded",
-            "api": "online",
-            "vector_db": "error",
-            "collection_status": "unknown",
-            "error": str(e)
-        }
-
-except Exception as e:
-        logger.error(f"Structured extraction failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Extraction failed: {str(e)}"
-        )
-
-
 @router.get("/documents")
-async def list_documents() -> dict[str, Any]:
+async def list_documents(
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> dict[str, Any]:
     """
-    List ingested documents / points stored in the Qdrant collection 
-    for the frontend document management view.
+    List ingested documents / points stored in the Qdrant collection.
     """
     try:
         from backend.db.qdrant import get_qdrant_client, COLLECTION_NAME
@@ -401,10 +414,13 @@ async def list_documents() -> dict[str, Any]:
         )
 
 
-@router.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str) -> dict[str, Any]:
+@router.delete("/documents/{doc_id}", dependencies=[Depends(require_editor_or_admin)])
+async def delete_document(
+    doc_id: str,
+    user: dict[str, Any] = Depends(verify_bearer_token)
+) -> dict[str, Any]:
     """
-    Delete a specific document chunk / point from the Qdrant collection by ID.
+    Delete a specific document chunk from Qdrant by ID. Restricted to Admins/Editors.
     """
     try:
         from backend.db.qdrant import get_qdrant_client, COLLECTION_NAME
@@ -417,7 +433,7 @@ async def delete_document(doc_id: str) -> dict[str, Any]:
             )
         )
         
-        logger.info(f"Successfully deleted document ID: {doc_id}")
+        logger.info(f"Successfully deleted document ID [{doc_id}] by [{user.get('sub')}].")
         return {
             "status": "success",
             "message": f"Document {doc_id} deleted successfully."
@@ -433,8 +449,7 @@ async def delete_document(doc_id: str) -> dict[str, Any]:
 @router.get("/health")
 async def intelligence_health_check() -> dict[str, Any]:
     """
-    Health check endpoint to verify Qdrant Cloud connection, 
-    collection status, and vector counts for the frontend telemetry widget.
+    Health check endpoint to verify Qdrant Cloud connection and collection status.
     """
     try:
         stats = await get_collection_stats()

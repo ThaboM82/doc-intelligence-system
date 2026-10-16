@@ -12,14 +12,14 @@ Default: OpenAI text-embedding-3-small → 1536-d (cosine in Qdrant).
 
 Env:
   OPENAI_API_KEY
-  OPENAI_EMBED_MODEL      default text-embedding-3-small
-  QDRANT_VECTOR_SIZE      default 1536
-  EMBED_BATCH_SIZE        default 16
-  EMBED_MAX_CHARS         default 30000 (per input truncation)
-  EMBED_MAX_RETRIES       default 3
-  EMBED_RETRY_BASE_SEC    default 0.8
-  EMBED_ALLOW_MOCK        default false
-  EMBED_CACHE_SIZE        default 256 (in-process LRU for identical strings)
+  OPENAI_EMBED_MODEL        default text-embedding-3-small
+  QDRANT_VECTOR_SIZE        default 1536
+  EMBED_BATCH_SIZE          default 16
+  EMBED_MAX_CHARS           default 30000 (per input truncation)
+  EMBED_MAX_RETRIES         default 3
+  EMBED_RETRY_BASE_SEC      default 0.8
+  EMBED_ALLOW_MOCK          default false
+  EMBED_CACHE_SIZE          default 256 (in-process LRU for identical strings)
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import struct
 import time
 from collections import OrderedDict
 from typing import Sequence
+from backend.observability.cost import get_cost_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,15 @@ def _openai_embed_sync(texts: Sequence[str]) -> list[list[float]]:
             response = client.embeddings.create(input=cleaned, model=EMBED_MODEL)
             ordered = sorted(response.data, key=lambda item: item.index)
             vectors = [_validate_dim(list(item.embedding), context=f"idx={item.index}") for item in ordered]
+            
+            # Record token costs via observability cost tracker
+            if hasattr(response, "usage") and response.usage:
+                tokens = getattr(response.usage, "total_tokens", 0)
+                try:
+                    get_cost_tracker().record_embed(EMBED_MODEL, tokens, route="/emb")
+                except Exception:
+                    pass
+
             return vectors
         except Exception as exc:
             last_exc = exc

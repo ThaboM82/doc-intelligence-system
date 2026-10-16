@@ -1,0 +1,27 @@
+groups:
+  - name: rag-cost
+    rules:
+      - alert: RagCostSpike
+        # > $0.10/hour sustained. Calibrate to your real traffic: check
+        # rate(rag_cost_dollars_total[1h]) * 3600 on the dashboard first.
+        expr: rate(rag_cost_dollars_total[1h]) * 3600 > 0.10
+        for: 15m
+        labels:
+          severity: warning
+          team: rag
+        annotations:
+          summary: "RAG spend above ${{ $value | humanize }}/hour"
+          description: "Estimated LLM spend is ${{ $value | humanize }}/h (threshold $0.10/h). Possible runaway loop, prompt blowup, or scraping. Check rag_tokens_total breakdown by model."
+
+  - name: rag-auth
+    rules:
+      - alert: RagRateLimitSpike
+        # > 0.5 rejected req/s sustained = someone hammering the API
+        expr: rate(rag_rate_limited_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          team: rag
+        annotations:
+          summary: "Rate limit rejections spiking ({{ $value }}/s)"
+          description: "Sustained 429 rejections. Possible abuse, misconfigured client retry loop, or RATE_LIMIT_MAX_REQUESTS too low for legit traffic."

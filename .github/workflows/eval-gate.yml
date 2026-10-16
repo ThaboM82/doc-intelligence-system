@@ -1,0 +1,59 @@
+name: eval-gate
+
+# Runs the golden-set evals against the deployed API on every PR and gates
+# the merge on accuracy, accuracy-vs-baseline, and p95 latency.
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install eval deps
+        run: |
+          pip install httpx prometheus-client langsmith
+          # full requirements install is heavy (torch/docling); the harness
+          # only needs httpx + the evaluation package. If your eval imports
+          # backend code, install with: pip install -e . instead.
+
+      - name: Run golden-set evals against deployed API
+        env:
+          API_BASE: ${{ secrets.EVAL_API_BASE }}   # e.g. https://your-api.onrender.com
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python -m backend.evaluation.harness \
+            --base-url "$API_BASE" \
+            --require-source \
+            --min-hit-rate 0.5 \
+            --out eval_results.json
+
+      - name: Regression gates
+        run: |
+          python -m backend.evaluation.gates \
+            --new eval_results.json \
+            --baseline backend/data/eval_set/baseline.json \
+            --min-accuracy 0.70 \
+            --max-accuracy-drop 0.05 \
+            --max-p95-ms 12000 \
+            --summary-out gate_summary.md
+
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: |
+            eval_results.json
+            gate_summary.md
+
+      - name: Post gate summary to PR
+        if: always()
+        run: cat gate_summary.md >> "$GITHUB_STEP_SUMMARY"
