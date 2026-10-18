@@ -1,11 +1,11 @@
-"""
+﻿"""
 tests/test_security_api.py
 
 API-level tests for /api/v1/security/* endpoints.
 Contract:
-  verify-headers → { passed, risk_score, threats_detected, details }
-  scan-prompt    → { passed, risk_score, threats_detected, details? }
-  scan-document  → { filename, is_flagged, status, threats_detected }
+  verify-headers â†’ { passed, risk_score, threats_detected, details }
+  scan-prompt    â†’ { passed, risk_score, threats_detected, details? }
+  scan-document  â†’ { filename, is_flagged, status, threats_detected }
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ class TestVerifyHeadersEndpoint:
         payload = {"headers": {"Corrupted": "HeaderData"}}
 
         with patch(
-            "app.security.validators.HeaderValidator.verify_spf_dkim_dmarc"
+            "backend.security.validators.HeaderValidator.verify_spf_dkim_dmarc"
         ) as mock_validator:
             mock_validator.side_effect = ValueError("Malformed header structure")
             response = client.post("/api/v1/security/verify-headers", json=payload)
@@ -202,7 +202,7 @@ class TestScanPromptEndpoint:
         payload = {"text": "Test input text"}
 
         with patch(
-            "app.security.validators.PromptInjectionDetector.scan_text"
+            "backend.security.validators.PromptInjectionDetector.scan_text"
         ) as mock_scan:
             mock_scan.side_effect = RuntimeError("Detector engine model timeout")
             response = client.post("/api/v1/security/scan-prompt", json=payload)
@@ -313,7 +313,7 @@ class TestIsolatedSecurityMocks:
         )
 
         with patch(
-            "app.security.validators.HeaderValidator.verify_spf_dkim_dmarc",
+            "backend.security.validators.HeaderValidator.verify_spf_dkim_dmarc",
             return_value=fake_report,
         ):
             response = client.post(
@@ -336,7 +336,7 @@ class TestIsolatedSecurityMocks:
         )
 
         with patch(
-            "app.security.validators.PromptInjectionDetector.scan_text",
+            "backend.security.validators.PromptInjectionDetector.scan_text",
             return_value=fake_report,
         ):
             response = client.post(

@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_validators.py
 
 Comprehensive unit test suite for app/security/validators.py.
@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover
 
     dns = types.SimpleNamespace(resolver=_ResolverStub)
 
-from app.security.validators import (
+from backend.security.validators import (
     HeaderValidationResult,
     HeaderValidator,
     PromptInjectionDetector,
@@ -56,7 +56,7 @@ class TestHeaderValidator:
         with pytest.raises(ValueError, match="Malformed header structure"):
             HeaderValidator.verify_spf_dkim_dmarc("not-a-dict")  # type: ignore[arg-type]
 
-    @patch("app.security.validators.HeaderValidator._query_dmarc_record")
+    @patch("backend.security.validators.HeaderValidator._query_dmarc_record")
     def test_header_validation_clean_pass(self, mock_dmarc):
         mock_dmarc.return_value = ("none", "v=DMARC1; p=none;")
 
@@ -76,7 +76,7 @@ class TestHeaderValidator:
         assert result.risk_score == 0.0
         assert "All authentication headers and alignment checks passed." in result.findings[0]
 
-    @patch("app.security.validators.HeaderValidator._query_dmarc_record")
+    @patch("backend.security.validators.HeaderValidator._query_dmarc_record")
     def test_header_validation_spf_softfail_and_neutral(self, mock_dmarc):
         mock_dmarc.return_value = ("none", "")
 
@@ -97,7 +97,7 @@ class TestHeaderValidator:
         res_neutral = HeaderValidator.verify_spf_dkim_dmarc(headers_neutral)
         assert res_neutral.spf_status == "neutral"
 
-    @patch("app.security.validators.HeaderValidator._query_dmarc_record")
+    @patch("backend.security.validators.HeaderValidator._query_dmarc_record")
     def test_header_validation_failures_and_domain_mismatch(self, mock_dmarc):
         mock_dmarc.return_value = ("quarantine", "v=DMARC1; p=quarantine;")
 
@@ -119,7 +119,7 @@ class TestHeaderValidator:
         assert any("SPF check failed" in f for f in result.findings)
         assert any("Domain mismatch" in f for f in result.findings)
 
-    @patch("app.security.validators.HeaderValidator._query_dmarc_record")
+    @patch("backend.security.validators.HeaderValidator._query_dmarc_record")
     def test_case_insensitive_header_keys(self, mock_dmarc):
         mock_dmarc.return_value = ("none", "")
         headers = {
@@ -131,7 +131,7 @@ class TestHeaderValidator:
         assert result.spf_status == "pass"
         assert result.is_suspicious is False
 
-    @patch("app.security.validators.HeaderValidator._query_dmarc_record")
+    @patch("backend.security.validators.HeaderValidator._query_dmarc_record")
     def test_arc_fail_raises_risk(self, mock_dmarc):
         mock_dmarc.return_value = ("none", "")
         headers = {
@@ -274,10 +274,11 @@ class TestPromptInjectionDetector:
 
     def test_homoglyph_normalization(self):
         # Combining accents stripped by NFKD path
-        text = "café"
+        text = "cafÃ©"
         normalized = PromptInjectionDetector.normalize_homoglyphs(text)
         assert "caf" in normalized.lower() or "cafe" in normalized.lower() or normalized
 
 
 # pytest import for raises
 import pytest  # noqa: E402
+

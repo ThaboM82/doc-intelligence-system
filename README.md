@@ -1,139 +1,152 @@
+# Document Intelligence & Security Platform
 
-🏗️ Solution Structure
+**Enterprise document ingestion · vector search · citation-backed RAG**
+
 Enterprise-grade document intelligence platform combining secure ingestion, vector search, citation-backed retrieval, and operational governance.
 
-https://img.shields.io/badge/Architecture-Layered-blue?style=flat-square https://img.shields.io/badge/RAG-Citation%20Backed-success?style=flat-square https://img.shields.io/badge/Security-First-red?style=flat-square https://img.shields.io/badge/Enterprise-Ready-purple?style=flat-square
+| | | |
+|--|--|--|
+| 🐍 Python 3.10+ | ⚡ FastAPI | ⚛️ React |
+| 🗄️ Qdrant | 🧠 OpenAI | 🚀 Render · ▲ Vercel |
+| 🏗️ Layered architecture | 📚 Citation-backed RAG | 🛡️ Security-first |
 
-📁 Repository Structure
-doc-intelligence-system/
-│
-├── backend/                        # FastAPI backend services
-│
-├── frontend/                       # React frontend application
-│   └── src/
-│       └── components/             # UI components
-│
-├── config/                         # Configuration and deployment settings
-│
-├── docker-compose.yml              # Container orchestration
-├── docker-compose.override.yml     # Local development overrides
-├── requirements.txt                # Python dependencies
-├── pyproject.toml                  # Python project configuration
-├── Makefile                        # Common operational commands
-├── .gitignore                      # Git exclusions
-└── README.md                       # Project documentation
-🧩 Platform Architecture
+| Layer | Stack | Host |
+|-------|--------|------|
+| 🔌 API | FastAPI · LangChain · OpenAI | Render |
+| 🗄️ Vectors | Qdrant Cloud (cosine, 1536-dim) | Qdrant |
+| 🖥️ UI | React · Vite · Tailwind · Lucide | Vercel |
+| 📦 Version | API 1.5.x | — |
+
+## 🏗️ Solution structure
+
+This repository is organized as a layered enterprise system: presentation, API, intelligence, data, security, and infrastructure—each with a clear responsibility boundary.
+
+## 💡 Why this project matters
+
+Organizations sit on large volumes of policies, contracts, runbooks, incident reports, and product docs. That knowledge is often locked in shared drives and PDFs, so people search manually, ask the same questions repeatedly, or make decisions without the latest approved text.
+
+**Document Intelligence & Security Platform** turns those files into a controlled, searchable knowledge layer:
+
+| Challenge | How this platform helps |
+|-----------|-------------------------|
+| 📂 Knowledge is scattered across files | Ingest once; retrieve by meaning (RAG), not only keywords |
+| ✅ Answers must be trustworthy | Responses are grounded in retrieved document chunks with source citations |
+| ⚠️ Security and compliance risk | Pre-index security scanning, upload limits, admin controls, audit-oriented ops endpoints |
+| 🚫 Shadow IT chat tools on sensitive docs | Keep data paths explicit: your API, your Qdrant, your OpenAI project |
+| 🐢 Slow onboarding and support | Staff query internal procedures in seconds instead of hunting through folders |
+
+This is not a generic chatbot. It is an enterprise document RAG system designed for accuracy, traceability, and governance.
+
+## 🧩 Platform architecture
+
+```text
 ┌────────────────────────────────────────────────────────────┐
 │                    Presentation Layer                       │
-│                                                             │
-│  React • Vite • Tailwind                                   │
-│  Upload • Search • Chat • Citations • Admin Dashboard      │
-└───────────────────────┬────────────────────────────────────┘
-                        │ HTTPS
-                        ▼
+│  React · Vite · Tailwind                                   │
+│  Upload · Search · Chat · Citations · Admin Dashboard      │
+└───────────────────────────┬────────────────────────────────┘
+                            │ HTTPS / CORS
+                            ▼
 ┌────────────────────────────────────────────────────────────┐
 │                         API Layer                           │
-│                                                             │
-│ FastAPI • Validation • Security Controls                   │
-│ Rate Limiting • Health Checks • Admin Operations           │
-└───────────────────────┬────────────────────────────────────┘
-                        │
-                        ▼
+│  FastAPI · Validation · Security Controls                  │
+│  Rate Limiting · Health Checks · Admin Operations          │
+└───────────────────────────┬────────────────────────────────┘
+                            │
+                            ▼
 ┌────────────────────────────────────────────────────────────┐
 │                    Intelligence Layer                       │
-│                                                             │
-│ Extraction • Chunking • Embeddings • RAG                   │
-│ Retrieval • Citations • Context Assembly                   │
-└───────────────────────┬────────────────────────────────────┘
-                        │
-          ┌─────────────┴─────────────┐
-          ▼                           ▼
-┌──────────────────┐        ┌──────────────────┐
-│ OpenAI           │        │ Qdrant Cloud     │
-│ Embeddings + LLM │        │ Vector Database  │
-└──────────────────┘        └──────────────────┘
-🔄 Document Lifecycle
-Every document follows a controlled processing pipeline designed for security, traceability, and retrieval accuracy.
+│  Extraction · Chunking · Embeddings · RAG                  │
+│  Retrieval · Citations · Context Assembly                  │
+└───────────────────────────┬────────────────────────────────┘
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+┌──────────────────┐            ┌──────────────────┐
+│ OpenAI           │            │ Qdrant Cloud     │
+│ Embeddings + LLM │            │ Vector Database  │
+└──────────────────┘            └──────────────────┘
 
+🔄 Document lifecycle
+Every document follows a controlled pipeline designed for security, traceability, and retrieval accuracy.
 📄 Upload
-      │
-      ▼
-✅ Validation
-      │
-      ▼
-🛡️ Security Scan
-      │
-      ▼
-📖 Text Extraction
-      │
-      ▼
-✂️ Chunking
-      │
-      ▼
-🧠 Embedding Generation
-      │
-      ▼
-🗄️ Qdrant Indexing
-      │
-      ▼
-🔍 Semantic Retrieval
-      │
-      ▼
-📚 Citation Assembly
-      │
-      ▼
-💬 Grounded Answer
-🎯 Business Capability Mapping
-Business Need	Platform Capability
-📄 Secure document onboarding	Upload validation and security scanning
-🔍 Fast knowledge discovery	Vector search and semantic retrieval
-✅ Trustworthy answers	RAG with source citations
-📊 Auditability	Metadata tracking and provenance
-🏛️ Governance	Administrative controls and operational endpoints
-👥 Employee self-service	Natural-language document search
-⚡ Faster onboarding	Searchable internal knowledge corpus
-🛡️ Compliance readiness	Controlled document lifecycle
-🔧 Backend Responsibilities
-Component	Responsibility
-📥 Ingestion	Upload validation and document processing
-🛡️ Security	Pre-index scanning and risk checks
-📖 Extraction	Text extraction from uploaded files
-✂️ Chunking	Prepare content for embeddings
-🧠 Embeddings	Generate OpenAI vector embeddings
-🗄️ Indexing	Store and manage vectors in Qdrant
-🔍 Retrieval	Semantic similarity search
-💬 RAG Engine	Generate grounded answers
-📈 Operations	Health checks, readiness probes, and monitoring
-🎨 Frontend Responsibilities
-Component	Responsibility
-📤 Upload Interface	Submit documents for indexing
-📚 Document Management	View and manage uploaded content
-💬 Chat Experience	Ask questions against indexed knowledge
-📑 Citation Viewer	Display evidence and source excerpts
-⚙️ Admin Controls	Operational and management functions
-📊 Status Dashboard	System visibility and feedback
-☁️ Infrastructure Responsibilities
-Service	Role
-▲ Vercel	Frontend hosting
-🚀 Render	FastAPI API hosting
-🗄️ Qdrant Cloud	Vector database
-🧠 OpenAI	Embeddings and generation
-🐳 Docker Compose	Local development orchestration
-🏛️ Separation of Concerns
-Layer	Purpose
-🎨 Presentation Layer	User experience and document interaction
-⚡ API Layer	Request handling and orchestration
-🧠 Intelligence Layer	RAG, embeddings, retrieval logic
-🗄️ Data Layer	Vector search and document indexing
-🔒 Security Layer	Validation, scanning, limits, governance
-☁️ Infrastructure Layer	Hosting, deployment, and scaling
-🚀 Why This Architecture Matters
-This architecture is intentionally designed around enterprise knowledge governance:
+  → ✅ Validation
+  → 🛡️ Security Scan
+  → 📖 Text Extraction
+  → ✂️ Chunking
+  → 🧠 Embedding Generation
+  → 🗄️ Qdrant Indexing
+  → 🔍 Semantic Retrieval
+  → 📚 Citation Assembly
+  → 💬 Grounded Answer
 
-✅ Documents are processed through a controlled ingestion pipeline.
-✅ Answers are generated from retrieved evidence, not model memory alone.
-✅ Sources and citations support review and auditability.
-✅ Application, vector storage, and AI services can scale independently.
-✅ Security controls exist before content reaches the retrieval layer.
-✅ Infrastructure components remain modular and replaceable.
-The result is a platform that transforms organizational documents into a secure, searchable, and citation-backed knowledge system rather than a generic chatbot experience.
+🎯 Business capability mapping
+Business need                   Platform capability
+📄 Secure document onboarding  Upload validation and security scanning
+🔍 Fast knowledge discovery    Vector search and semantic retrieval
+✅ Trustworthy answers         RAG with source citations                                 📊 Auditability                Metadata tracking and provenance
+🏛️ Governance                  Administrative controls and operational endpoints
+👥 Employee self-service       Natural-language document sear                             ⚡ Faster onboarding           Searchable internal knowledge corpus 
+🛡️ Compliance readiness        Controlled document lifecycle 
+
+📁 Repository structure
+doc-intelligence-system/
+├── .github/workflows/           # CI tests, eval gates, deploy hooks
+├── backend/                     # FastAPI application
+│   ├── main.py                  # Entrypoint: lifespan, middleware, probes
+│   ├── routers/                 # Canonical HTTP API
+│   │   ├── ingestion.py         # Document upload
+│   │   ├── documents.py         # List / get / delete
+│   │   ├── rag.py               # RAG query
+│   │   ├── auth.py
+│   │   ├── admin.py
+│   │   └── intelligence.py
+│   ├── services/                # Domain logic
+│   │   ├── ingest_service.py
+│   │   ├── embeddings.py
+│   │   └── rag_service.py
+│   ├── security/                # Scanning + validators (RBAC, injection)
+│   ├── observability/           # cost, metrics, tracing
+│   ├── db/                      # Qdrant client + optional SQL
+│   ├── core/                    # Shared config / telemetry helpers
+│   ├── data/                    # Samples, eval sets, local uploads
+│   ├── evaluation/              # Eval harness helpers
+│   ├── models/                  # LLM factory and related models
+│   ├── ingestion/               # Alternate/legacy pipeline modules
+│   └── api/                     # Legacy scaffolds (prefer routers/)
+├── frontend/                    # React + Vite UI (Vercel root)
+│   └── src/
+│       ├── App.tsx
+│       ├── components/          # Upload, RAG chat, security, admin, login
+│       └── lib/apiClient.ts
+├── evals/
+│   └── run_evals.py             # CLI evaluation against API
+├── tests/                       # pytest suites
+├── scripts/                     # Operational utilities
+├── config/                      # Shared configuration assets
+├── docker-compose.yml           # Local orchestration
+├── docker-compose.override.yml  # Local overrides (optional)
+├── requirements.txt             # Production Python dependencies
+├── requirements-ml.txt          # Local heavy ML / Docling only
+├── pyproject.toml
+├── Makefile                     # Common operational commands
+└── README.md
+
+🔐 Environment variables
+Backend (Render / local .env)
+
+Variable             Required       Description                       OPENAI_API_KEY       ✅ Yes         Embeddings and chat
+QDRANT_URL           ✅ Yes         Cluster endpoint
+QDRANT_API_KEY       ✅ Yes(Cloud)  Qdrant API key
+QDRANT_COLLECTION    ⚪ No          Default document_intelligence
+QDRANT_VECTOR_SIZE   ⚪ No          Default 1536
+CORS_ORIGINS         ✅ Yes (prod)  Comma-separated allowed origins
+ADMIN_API_KEY /      ⭐             Admin route protection 
+ADMIN_API_TOKEN       Recommended  
+ENVIRONMENT          ⭐             Use production in live deployment
+                      Recommended 
+LANGSMITH_TRACING    ⚪ Optional    Enable with LANGSMITH_API_KEY
+
+📄 License
+Proprietary / internal use unless otherwise specified by the repository owner.
+📦 Repository: https://github.com/ThaboM82/doc-intelligence-system

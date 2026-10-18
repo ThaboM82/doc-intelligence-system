@@ -65,9 +65,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from backend.api.v1.alerts import router as alert_router
-
-
-app.include_router(alert_router)
+from backend.hitl.router import router as hitl_router
 
 try:
     from langchain_openai import ChatOpenAI
@@ -272,6 +270,8 @@ app = FastAPI(
     openapi_url="/openapi.json",
     lifespan=lifespan,
 )
+app.include_router(hitl_router)
+app.include_router(alert_router)
 
 # ---------------------------------------------------------------------------
 # Middleware
@@ -285,17 +285,6 @@ app.add_middleware(
     expose_headers=["X-Request-ID", "X-Response-Time-MS"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-@app.get("/metrics", tags=["Observability"])
-async def metrics() -> Response:
-    """
-    Expose Prometheus metrics for scraping.
-    """
-    body, ctype = metrics_payload()
-    return Response(body, media_type=ctype)
-
-app.include_router(intelligence_router)
-app.include_router(alerts_router)
 
 @app.get("/")
 async def root():
@@ -881,7 +870,7 @@ async def prometheus_metrics():
             2,
         )
     qdrant_ready_gauge = 1 if is_collection_ready() else 0
-    lines = [
+    metrics_payload = [
         "# HELP doc_intelligence_uptime_seconds Total runtime in seconds",
         "# TYPE doc_intelligence_uptime_seconds counter",
         f"doc_intelligence_uptime_seconds {uptime}",
@@ -903,21 +892,25 @@ async def prometheus_metrics():
     ]
     for path, count in request_metrics["endpoint_hits"].items():
         safe = str(path).replace('"', "")
-        lines.append(f'doc_intelligence_endpoint_hits_total{{path="{safe}"}} {count}')
+        metrics_payload.append(
+            f'doc_intelligence_endpoint_hits_total{{path="{safe}"}} {count}'
+        )
     for code, count in request_metrics["status_code_counts"].items():
-        lines.append(f'doc_intelligence_status_code_total{{code="{code}"}} {count}')
+        metrics_payload.append(
+            f'doc_intelligence_status_code_total{{code="{code}"}} {count}'
+        )
 
     if _get_telemetry is not None:
         try:
-            lines.append(_get_telemetry().prometheus_lines().rstrip())
+            metrics_payload.append(_get_telemetry().prometheus_lines().rstrip())
         except Exception:
             pass
 
     # Append rag_* histograms/counters registered by backend.observability.metrics
     if _generate_latest is not None:
-        lines.append(_generate_latest().decode("utf-8").rstrip())
+        metrics_payload.append(_generate_latest().decode("utf-8").rstrip())
 
-    return "\n".join(lines) + "\n"
+    return "\n".join(metrics_payload) + "\n"
 
 
 # ---------------------------------------------------------------------------

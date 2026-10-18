@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_security_routes.py
 
 Comprehensive integration test suite for security API endpoints in
@@ -16,9 +16,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.routes.security import get_vector_store
-from app.api.routes.security import router as security_router
-from app.security.validators import HeaderValidationResult, PromptInjectionResult
+from backend.routers.security import get_vector_store
+from backend.routers.security import router as security_router
+from backend.security.validators import HeaderValidationResult, PromptInjectionResult
 
 # ==============================================================================
 # Fixtures
@@ -261,7 +261,7 @@ class TestBatchAndHeaderRoutes:
         assert len(data) == 1
         assert data[0]["is_flagged"] is False
 
-    @patch("app.security.validators.HeaderValidator._query_dmarc_record")
+    @patch("backend.security.validators.HeaderValidator._query_dmarc_record")
     def test_verify_headers_clean_pass(self, mock_dmarc, client):
         mock_dmarc.return_value = ("none", "v=DMARC1; p=none;")
 
@@ -365,9 +365,9 @@ class TestAuditAndQuarantineRoutes:
         assert data["recommended_action"] == "QUARANTINE"
 
     def test_audit_pipeline_flag_for_review_band(self, client):
-        """Moderate risk should FLAG_FOR_REVIEW when 0.35–0.70."""
+        """Moderate risk should FLAG_FOR_REVIEW when 0.35â€“0.70."""
         with patch(
-            "app.security.validators.HeaderValidator.verify_spf_dkim_dmarc"
+            "backend.security.validators.HeaderValidator.verify_spf_dkim_dmarc"
         ) as mock_hdr:
             mock_hdr.return_value = HeaderValidationResult(
                 from_domain="x.com",
@@ -383,7 +383,7 @@ class TestAuditAndQuarantineRoutes:
                 findings=["SPF softfail/neutral status detected"],
             )
             with patch(
-                "app.security.validators.PromptInjectionDetector.scan_text"
+                "backend.security.validators.PromptInjectionDetector.scan_text"
             ) as mock_scan:
                 mock_scan.return_value = PromptInjectionResult(
                     is_flagged=False,

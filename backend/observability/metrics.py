@@ -136,7 +136,7 @@ SYNTHESIS_PATH = _counter(
 )
 
 # ---------------------------------------------------------------------------
-# HTTP / app metrics
+# HTTP / app & HITL metrics
 # ---------------------------------------------------------------------------
 
 HTTP_REQUESTS = _counter(
@@ -172,6 +172,12 @@ ERRORS = _counter(
     "app_errors_total",
     "Application errors by component",
     ["component"],
+)
+
+HITL_TRIGGERS_TOTAL = _counter(
+    "hitl_triggers_total",
+    "Total Human-in-the-Loop review triggers by category",
+    ["category"],
 )
 
 CONTENT_TYPE = CONTENT_TYPE_LATEST
@@ -272,6 +278,11 @@ def record_error(component: str) -> None:
         ERRORS.labels(component=component or "unknown").inc()
 
 
+def record_hitl_trigger(category: str) -> None:
+    if HITL_TRIGGERS_TOTAL is not None:
+        HITL_TRIGGERS_TOTAL.labels(category=category or "unknown").inc()
+
+
 def record_rag_turn(
     *,
     e2e_seconds: float | None = None,
@@ -330,6 +341,7 @@ __all__ = [
     "INGEST_CHUNKS",
     "QDRANT_UP",
     "ERRORS",
+    "HITL_TRIGGERS_TOTAL",
     "CONTENT_TYPE",
     "observe_e2e",
     "observe_stage",
@@ -344,6 +356,7 @@ __all__ = [
     "record_ingest",
     "set_qdrant_up",
     "record_error",
+    "record_hitl_trigger",
     "record_rag_turn",
     "metrics_payload",
     "metrics_enabled",

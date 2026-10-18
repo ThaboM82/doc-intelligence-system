@@ -26,8 +26,13 @@ import logging
 import os
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+
+from backend.security.dependencies import (
+    verify_and_get_tenant_id,
+    verify_enterprise_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,13 +127,30 @@ def _payload_tags(payload: dict[str, Any]) -> list[str]:
 
 
 async def _scroll_all_points(
+    tenant_id: str | None = None,
     limit_per_page: int = SCROLL_PAGE,
     max_points: int = SCROLL_MAX,
 ) -> list[Any]:
-    """Scroll collection points (payload only). Caps at max_points."""
+    """Scroll collection points (payload only). Caps at max_points.
+    Optionally applies tenant_id payload filter.
+    """
+    from qdrant_client.http import models as qm
+
     client = await _client()
     points: list[Any] = []
     next_offset: Any = None
+
+    # Construct Qdrant filter if tenant_id is provided
+    scroll_filter = None
+    if tenant_id:
+        scroll_filter = qm.Filter(
+            must=[
+                qm.FieldCondition(
+                    key="tenant_id",
+                    match=qm.MatchValue(value=tenant_id),
+                )
+            ]
+        )
 
     while len(points) < max_points:
         kwargs: dict[str, Any] = {
@@ -137,6 +159,8 @@ async def _scroll_all_points(
             "with_payload": True,
             "with_vectors": False,
         }
+        if scroll_filter:
+            kwargs["scroll_filter"] = scroll_filter
         if next_offset is not None:
             kwargs["offset"] = next_offset
 
@@ -324,9 +348,9 @@ def _sort_docs(
     return sorted(docs, key=_sort_key_uploaded, reverse=reverse)
 
 
-async def _count_points_for_doc(document_id: str) -> int:
+async def _count_points_for_doc(document_id: str, tenant_id: str | None = None) -> int:
     """Best-effort count before delete."""
-    points = await _scroll_all_points()
+    points = await _scroll_all_points(tenant_id=tenant_id)
     n = 0
     for p in points:
         payload = getattr(p, "payload", None) or {}
@@ -358,8 +382,10 @@ async def list_documents(
     ),
     sort: Literal["uploaded_at", "filename", "chunks"] = Query("uploaded_at"),
     order: Literal["asc", "desc"] = Query("desc"),
+    tenant_id: str = Depends(verify_and_get_tenant_id),
+    api_key: str = Depends(verify_enterprise_api_key),
 ) -> DocumentListResponse:
-    points = await _scroll_all_points()
+    points = await _scroll_all_points(tenant_id=tenant_id)
     docs = _group_documents(points)
     docs = _apply_filters(
         docs,
@@ -383,6 +409,7 @@ async def list_documents(
             "security": security,
             "sort": sort,
             "order": order,
+            "tenant_id": tenant_id,
         }.items()
         if v is not None and v != ""
     }
@@ -399,25 +426,33 @@ async def list_documents(
 
 
 @router.get("/{document_id}", response_model=DocumentSummary)
-async def get_document(document_id: str) -> DocumentSummary:
+async def get_document(
+    document_id: str,
+    tenant_id: str = Depends(verify_and_get_tenant_id),
+    api_key: str = Depends(verify_enterprise_api_key),
+) -> DocumentSummary:
     document_id = (document_id or "").strip()
     if not document_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid document_id")
 
-    points = await _scroll_all_points()
+    points = await _scroll_all_points(tenant_id=tenant_id)
     docs = _group_documents(points)
     for d in docs:
         if d.document_id == document_id or d.id == document_id:
             return d
     raise HTTPException(
         status.HTTP_404_NOT_FOUND,
-        detail=f"Document '{document_id}' not found",
+        detail=f"Document '{document_id}' not found for tenant '{tenant_id}'",
     )
 
 
 @router.delete("/{document_id}", response_model=DeleteResponse)
-async def delete_document(document_id: str) -> DeleteResponse:
-    """Delete all Qdrant points for this document_id (payload filter)."""
+async def delete_document(
+    document_id: str,
+    tenant_id: str = Depends(verify_and_get_tenant_id),
+    api_key: str = Depends(verify_enterprise_api_key),
+) -> DeleteResponse:
+    """Delete all Qdrant points for this document_id (payload filter + tenant isolation)."""
     from qdrant_client.http import models as qm
 
     document_id = (document_id or "").strip()
@@ -430,24 +465,33 @@ async def delete_document(document_id: str) -> DeleteResponse:
     try:
         # Count first for a useful response
         try:
-            points_deleted = await _count_points_for_doc(document_id)
+            points_deleted = await _count_points_for_doc(
+                document_id, tenant_id=tenant_id
+            )
         except Exception:
             points_deleted = 0
 
         deleted_via_filter = False
         for key in ("document_id", "doc_id"):
             try:
+                must_conditions = [
+                    qm.FieldCondition(
+                        key=key,
+                        match=qm.MatchValue(value=document_id),
+                    )
+                ]
+                if tenant_id:
+                    must_conditions.append(
+                        qm.FieldCondition(
+                            key="tenant_id",
+                            match=qm.MatchValue(value=tenant_id),
+                        )
+                    )
+
                 await client.delete(
                     collection_name=COLLECTION,
                     points_selector=qm.FilterSelector(
-                        filter=qm.Filter(
-                            must=[
-                                qm.FieldCondition(
-                                    key=key,
-                                    match=qm.MatchValue(value=document_id),
-                                )
-                            ]
-                        )
+                        filter=qm.Filter(must=must_conditions)
                     ),
                 )
                 deleted_via_filter = True
@@ -459,7 +503,7 @@ async def delete_document(document_id: str) -> DeleteResponse:
                 continue
 
         if not deleted_via_filter:
-            points = await _scroll_all_points()
+            points = await _scroll_all_points(tenant_id=tenant_id)
             ids: list[Any] = []
             for p in points:
                 payload = getattr(p, "payload", None) or {}
@@ -470,7 +514,7 @@ async def delete_document(document_id: str) -> DeleteResponse:
             if not ids:
                 raise HTTPException(
                     status.HTTP_404_NOT_FOUND,
-                    detail=f"Document '{document_id}' not found in vector store",
+                    detail=f"Document '{document_id}' not found in vector store for tenant '{tenant_id}'",
                 )
             await client.delete(
                 collection_name=COLLECTION,
@@ -478,7 +522,6 @@ async def delete_document(document_id: str) -> DeleteResponse:
             )
             points_deleted = len(ids)
         elif points_deleted == 0:
-            # Filter delete ran but we couldn't count — still report success
             points_deleted = 0
 
     except HTTPException:
@@ -494,5 +537,5 @@ async def delete_document(document_id: str) -> DeleteResponse:
         status="deleted",
         document_id=document_id,
         points_deleted=max(points_deleted, 0),
-        message=f"Removed vector points for document_id={document_id}",
+        message=f"Removed vector points for document_id={document_id} under tenant={tenant_id}",
     )
