@@ -7,10 +7,11 @@ Render (API) + Vercel (frontend). Qdrant via QDRANT_URL / QDRANT_API_KEY.
 Integrates:
   - Soft-fail Qdrant + optional SQL init
   - LLMFactory (primary + fallback)
-  - Routers: intelligence, ingestion, documents, security, rag, auth, admin
+  - Routers: intelligence, ingestion, documents, security, rag, auth, admin,
+    HITL, alerts, security_stream (soft-fail)
   - Rate limit, security headers, telemetry middleware
-  - /health /ready /metrics (+ optional core.telemetry)
-  - rag_* Prometheus metrics via backend.observability (Project 3)
+  - /health /ready /metrics (metrics_payload + legacy gauges)
+  - Prometheus Pushgateway loop (optional)
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Path bootstrap — uvicorn backend.main:app and python backend/main.py
+# Path bootstrap
 # ---------------------------------------------------------------------------
 _file_path = Path(__file__).resolve()
 _backend_dir = _file_path.parent
@@ -64,8 +65,6 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from backend.api.v1.alerts import router as alert_router
-from backend.hitl.router import router as hitl_router
 
 try:
     from langchain_openai import ChatOpenAI
@@ -87,7 +86,7 @@ logging.basicConfig(
 logger = logging.getLogger("document_intelligence_api")
 
 # ---------------------------------------------------------------------------
-# Optional set_active_llm_factory
+# Optional helpers
 # ---------------------------------------------------------------------------
 try:
     from backend.routers.intelligence import set_active_llm_factory
@@ -97,13 +96,11 @@ except ImportError:  # pragma: no cover
         logger.warning("set_active_llm_factory unavailable")
 
 
-# ---------------------------------------------------------------------------
-# Optional SQL + telemetry stores
-# ---------------------------------------------------------------------------
 _init_db = None
 _close_db = None
 try:
-    from backend.db.database import init_db as _init_db, close_db as _close_db
+    from backend.db.database import close_db as _close_db
+    from backend.db.database import init_db as _init_db
 except ImportError:
     logger.info("SQL database module not loaded (optional)")
 
@@ -113,23 +110,16 @@ try:
 except ImportError:
     logger.info("core.telemetry not loaded — using in-process request_metrics only")
 
-# ---------------------------------------------------------------------------
-# Prometheus client metrics (rag_* histograms/counters) — optional soft-fail
-# ---------------------------------------------------------------------------
-_generate_latest = None
 try:
-    from prometheus_client import generate_latest
-
-    import backend.observability.metrics  # noqa: F401 — registers rag_* collectors
-    _generate_latest = generate_latest
+    import backend.observability.metrics  # noqa: F401
 except ImportError:
     logger.info(
-        "prometheus-client not installed — rag_* metrics unavailable. "
-        "Run: pip install prometheus-client"
+        "prometheus-client / observability.metrics unavailable. "
+        "pip install prometheus-client"
     )
 
 # ---------------------------------------------------------------------------
-# Config & legacy request metrics
+# Config
 # ---------------------------------------------------------------------------
 API_VERSION = os.getenv("API_VERSION", "1.5.0")
 system_start_time = time.time()
@@ -152,9 +142,7 @@ API_KEY_HEADER = "X-API-Key"
 EXPECTED_ADMIN_KEY = os.getenv("ADMIN_API_KEY", "")
 
 _DEFAULT_CORS = (
-    "http://localhost:5173,"
-    "http://localhost:3000,"
-    "http://127.0.0.1:5173"
+    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173"
 )
 CORS_ORIGINS = [
     o.strip()
@@ -162,6 +150,18 @@ CORS_ORIGINS = [
     if o.strip()
 ]
 _ALLOW_ALL_ORIGINS = "*" in CORS_ORIGINS
+
+_FEATURES: dict[str, bool] = {}
+
+
+def _sync_feature_flags() -> None:
+    """Push _FEATURES into health router when available."""
+    try:
+        from backend.routers.health import set_feature_flags
+
+        set_feature_flags(dict(_FEATURES))
+    except Exception:
+        pass
 
 
 async def verify_admin_access(
@@ -187,7 +187,9 @@ def _normalize_metric_path(path: str) -> str:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    logger.info("Initializing Document Intelligence & Security API v%s ...", API_VERSION)
+    logger.info(
+        "Initializing Document Intelligence & Security API v%s ...", API_VERSION
+    )
 
     if _init_db is not None:
         try:
@@ -199,11 +201,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     qdrant_ok = await init_qdrant_collection(raise_on_error=False)
     if qdrant_ok:
         logger.info("Qdrant collection ready")
+        try:
+            from backend.observability.metrics import set_qdrant_up
+
+            set_qdrant_up(True)
+        except Exception:
+            pass
     else:
         logger.error(
             "Qdrant unavailable at startup — vector features degraded. "
             "Set QDRANT_URL (and QDRANT_API_KEY for Cloud)."
         )
+        try:
+            from backend.observability.metrics import set_qdrant_up
+
+            set_qdrant_up(False)
+        except Exception:
+            pass
 
     openai_key = os.getenv("OPENAI_API_KEY", "")
     llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.1"))
@@ -225,13 +239,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 cache_ttl_sec=300.0,
             )
             set_active_llm_factory(factory)
+            _FEATURES["llm_factory"] = True
             logger.info("LLM Factory initialized (primary + fallback)")
         except Exception as exc:
             logger.error("LLM Factory init failed (API starts degraded): %s", exc)
+            _FEATURES["llm_factory"] = False
     else:
         logger.warning(
             "Skipping LLM Factory — ChatOpenAI unavailable or OPENAI_API_KEY not set"
         )
+        _FEATURES["llm_factory"] = False
 
     try:
         from backend.observability.tracing import tracing_enabled
@@ -243,13 +260,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception:
         pass
 
+    try:
+        from backend.observability.push_loop import start_push_loop
+
+        if start_push_loop():
+            logger.info("Prometheus Pushgateway loop active")
+    except Exception as exc:
+        logger.debug("push loop not started: %s", exc)
+
+    _sync_feature_flags()
+
     yield
+
+    try:
+        from backend.observability.push_loop import stop_push_loop
+
+        await stop_push_loop()
+    except Exception as exc:
+        logger.debug("push loop stop failed: %s", exc)
 
     if _close_db is not None:
         try:
             await _close_db()
         except Exception as exc:
             logger.warning("SQL close failed: %s", exc)
+
     await close_qdrant_client()
     logger.info("Shut down API services and released resources.")
 
@@ -270,8 +305,25 @@ app = FastAPI(
     openapi_url="/openapi.json",
     lifespan=lifespan,
 )
-app.include_router(hitl_router)
-app.include_router(alert_router)
+
+# Soft-fail optional routers (HITL / alerts / SSE stream)
+for _label, _import in (
+    ("hitl", "backend.hitl.router"),
+    ("alerts", "backend.api.v1.alerts"),
+    ("security_stream", "backend.routers.security_stream"),
+):
+    try:
+        mod = importlib.import_module(_import)
+        r = getattr(mod, "router", None)
+        if r is not None:
+            app.include_router(r)
+            _FEATURES[_label] = True
+            logger.info("Registered %s router", _label)
+        else:
+            _FEATURES[_label] = False
+    except Exception as exc:
+        _FEATURES[_label] = False
+        logger.warning("%s router not loaded: %s", _label, exc)
 
 # ---------------------------------------------------------------------------
 # Middleware
@@ -285,10 +337,6 @@ app.add_middleware(
     expose_headers=["X-Request-ID", "X-Response-Time-MS"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-@app.get("/")
-async def root():
-    return {"status": "online", "system": "Document Intelligence API"}
 
 
 @app.middleware("http")
@@ -315,6 +363,18 @@ async def security_and_telemetry_middleware(request: Request, call_next):
             rate_limit_tracker.pop(ip, None)
 
     if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
+        try:
+            from backend.security.event_publish import emit_rate_limit_hit
+
+            emit_rate_limit_hit(client=client_ip, path=request.url.path)
+        except Exception:
+            pass
+        try:
+            from backend.observability.metrics import record_ops_rate_limit_hit
+
+            record_ops_rate_limit_hit()
+        except Exception:
+            pass
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={
@@ -331,6 +391,7 @@ async def security_and_telemetry_middleware(request: Request, call_next):
     try:
         response: Response = await call_next(request)
         duration_ms = round((time.time() - start_time) * 1000, 2)
+        duration_s = duration_ms / 1000.0
         normalized_path = _normalize_metric_path(request.url.path)
 
         request_metrics["total_requests"] += 1
@@ -341,6 +402,18 @@ async def security_and_telemetry_middleware(request: Request, call_next):
             request_metrics["failed_requests"] += 1
         request_metrics["total_processing_time_ms"] += duration_ms
         request_metrics["endpoint_hits"][normalized_path] += 1
+
+        try:
+            from backend.observability.metrics import record_http
+
+            record_http(
+                request.method,
+                normalized_path,
+                response.status_code,
+                duration_s,
+            )
+        except Exception:
+            pass
 
         if _get_telemetry is not None:
             try:
@@ -363,6 +436,12 @@ async def security_and_telemetry_middleware(request: Request, call_next):
         request_metrics["total_requests"] += 1
         request_metrics["failed_requests"] += 1
         request_metrics["status_code_counts"][500] += 1
+        try:
+            from backend.observability.metrics import record_error
+
+            record_error("middleware")
+        except Exception:
+            pass
         logger.error(
             "Unhandled exception on path %s [ID: %s]: %s",
             request.url.path,
@@ -380,7 +459,7 @@ async def security_and_telemetry_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
-# Optional routers
+# Optional domain routers
 # ---------------------------------------------------------------------------
 HeaderValidator = None
 PromptInjectionDetector = None
@@ -391,6 +470,7 @@ security_router = None
 rag_router = None
 auth_router = None
 admin_router = None
+health_router = None
 pipeline = None
 
 
@@ -421,7 +501,9 @@ for _module_name in (
     "app.routers.ingestion",
 ):
     try:
-        ingestion_router = getattr(importlib.import_module(_module_name), "router", None)
+        ingestion_router = getattr(
+            importlib.import_module(_module_name), "router", None
+        )
         if ingestion_router is not None:
             break
     except ImportError:
@@ -440,7 +522,9 @@ for _module_name in (
     "app.routers.security",
 ):
     try:
-        security_router = getattr(importlib.import_module(_module_name), "router", None)
+        security_router = getattr(
+            importlib.import_module(_module_name), "router", None
+        )
         if security_router is not None:
             break
     except ImportError:
@@ -463,37 +547,76 @@ try:
 except Exception:
     logger.warning("Admin router could not be imported.")
 
+# Optional health router — only mount if it does NOT redefine /metrics
+# (this main.py owns GET /metrics). Mount when HEALTH_ROUTER_MOUNT=true.
+if os.getenv("HEALTH_ROUTER_MOUNT", "false").lower() in ("1", "true", "yes"):
+    try:
+        from backend.routers.health import router as health_router
+
+        app.include_router(health_router)
+        _FEATURES["health_router"] = True
+        logger.info("Registered health router (HEALTH_ROUTER_MOUNT=true)")
+    except Exception as exc:
+        _FEATURES["health_router"] = False
+        logger.warning("health router not loaded: %s", exc)
+else:
+    _FEATURES["health_router"] = False
+
 if intelligence_router is not None:
     app.include_router(intelligence_router)
+    _FEATURES["intelligence"] = True
     logger.info("Registered intelligence router")
+else:
+    _FEATURES["intelligence"] = False
 
 if ingestion_router is not None:
     app.include_router(ingestion_router)
+    _FEATURES["ingestion"] = True
     logger.info("Registered ingestion router")
+else:
+    _FEATURES["ingestion"] = False
 
 if documents_router is not None:
     app.include_router(documents_router)
+    _FEATURES["documents"] = True
     logger.info("Registered documents router at /api/v1/documents")
+else:
+    _FEATURES["documents"] = False
 
 if security_router is not None:
     app.include_router(security_router)
-    logger.info("Registered security router")
+    _FEATURES["security"] = True
+    logger.info("Registered security router at /api/v1/security")
 else:
+    _FEATURES["security"] = False
     logger.warning("Security router missing — built-in fallback routes will apply.")
 
 if rag_router is not None:
     app.include_router(rag_router)
+    _FEATURES["rag"] = True
     logger.info("Registered RAG router at /api/v1/rag")
 else:
+    _FEATURES["rag"] = False
     logger.warning("RAG router missing — stub /api/v1/rag/query fallback will apply.")
 
 if auth_router is not None:
     app.include_router(auth_router)
+    _FEATURES["auth"] = True
     logger.info("Registered auth router at /api/v1/auth")
+else:
+    _FEATURES["auth"] = False
 
 if admin_router is not None:
     app.include_router(admin_router)
+    _FEATURES["admin"] = True
     logger.info("Registered admin router at /api/v1/admin")
+else:
+    _FEATURES["admin"] = False
+
+_FEATURES["qdrant"] = True
+
+# Final feature-flag sync after all routers are registered
+_sync_feature_flags()
 
 
 # ---------------------------------------------------------------------------
@@ -565,14 +688,15 @@ class ScanPromptRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Security response helpers
+# Security helpers + fallbacks
 # ---------------------------------------------------------------------------
 def _header_api_response(report: Any) -> dict[str, Any]:
     findings = list(getattr(report, "findings", None) or [])
     threats = [
         f
         for f in findings
-        if "passed" not in str(f).lower() and "all authentication" not in str(f).lower()
+        if "passed" not in str(f).lower()
+        and "all authentication" not in str(f).lower()
     ]
     suspicious = bool(getattr(report, "is_suspicious", False))
     return {
@@ -621,9 +745,6 @@ def _prompt_api_response(report: Any) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Security fallback routes (only if no security_router)
-# ---------------------------------------------------------------------------
 if security_router is None:
 
     @app.post("/api/v1/security/verify-headers", tags=["Security"])
@@ -681,8 +802,10 @@ if security_router is None:
             return {
                 "filename": name,
                 "is_flagged": report.blocked or not report.passed,
-                "status": "quarantined" if report.blocked else (
-                    "flagged" if not report.passed else "verified_safe"
+                "status": (
+                    "quarantined"
+                    if report.blocked
+                    else ("flagged" if not report.passed else "verified_safe")
                 ),
                 "threats_detected": [f.category for f in report.findings],
                 "risk_score": report.score,
@@ -796,6 +919,12 @@ async def health_check():
     qdrant = await qdrant_health_check()
     qdrant_ok = bool(qdrant.get("ok"))
     coll_ready = is_collection_ready()
+    try:
+        from backend.observability.metrics import set_qdrant_up
+
+        set_qdrant_up(qdrant_ok)
+    except Exception:
+        pass
 
     return SystemStatusResponse(
         status="ok" if qdrant_ok and coll_ready else "degraded",
@@ -811,9 +940,21 @@ async def health_check():
 @app.get("/ready", response_model=ReadinessProbeResponse, status_code=status.HTTP_200_OK)
 async def readiness_check():
     validators_ok = bool(PromptInjectionDetector and HeaderValidator)
-    pipeline_ok = pipeline is not None or ingestion_router is not None
+    pipeline_ok = (
+        pipeline is not None
+        or ingestion_router is not None
+        or documents_router is not None
+    )
     qdrant = await qdrant_health_check()
     qdrant_ok = bool(qdrant.get("ok")) and is_collection_ready()
+
+    push_status: dict[str, Any] = {"enabled": False, "running": False}
+    try:
+        from backend.observability.push_loop import get_push_loop_status
+
+        push_status = get_push_loop_status()
+    except Exception:
+        pass
 
     core_ok = qdrant_ok and (rag_router is not None or ingestion_router is not None)
     status_str = "ready" if core_ok else "degraded"
@@ -830,12 +971,23 @@ async def readiness_check():
             "header_validator": "active" if HeaderValidator else "unavailable",
             "ingestion_pipeline": "active" if pipeline_ok else "unavailable",
             "ingestion_router": "mounted" if ingestion_router is not None else "stub",
-            "documents_router": "mounted" if documents_router is not None else "missing",
-            "security_router": "mounted" if security_router is not None else "fallback",
+            "documents_router": (
+                "mounted" if documents_router is not None else "missing"
+            ),
+            "security_router": (
+                "mounted" if security_router is not None else "fallback"
+            ),
             "rag_router": "mounted" if rag_router is not None else "fallback",
             "auth_router": "mounted" if auth_router is not None else "missing",
             "admin_router": "mounted" if admin_router is not None else "missing",
+            "hitl": "mounted" if _FEATURES.get("hitl") else "missing",
+            "security_stream": (
+                "mounted" if _FEATURES.get("security_stream") else "missing"
+            ),
+            "llm_factory": "ok" if _FEATURES.get("llm_factory") else "unavailable",
+            "pushgateway": push_status,
             "qdrant": qdrant,
+            "features": dict(_FEATURES),
         },
     )
 
@@ -861,6 +1013,18 @@ async def get_telemetry_legacy(_: None = Depends(verify_admin_access)):
 
 @app.get("/metrics", response_class=PlainTextResponse, status_code=status.HTTP_200_OK)
 async def prometheus_metrics():
+    """Prefer observability.metrics.metrics_payload(); append legacy gauges."""
+    chunks: list[str] = []
+
+    try:
+        from backend.observability.metrics import metrics_payload
+
+        body, _ctype = metrics_payload()
+        if body:
+            chunks.append(body.decode("utf-8").rstrip())
+    except Exception as exc:
+        logger.debug("metrics_payload failed: %s", exc)
+
     uptime = round(time.time() - system_start_time, 2)
     avg_latency = 0.0
     if request_metrics["total_requests"] > 0:
@@ -870,7 +1034,7 @@ async def prometheus_metrics():
             2,
         )
     qdrant_ready_gauge = 1 if is_collection_ready() else 0
-    metrics_payload = [
+    legacy = [
         "# HELP doc_intelligence_uptime_seconds Total runtime in seconds",
         "# TYPE doc_intelligence_uptime_seconds counter",
         f"doc_intelligence_uptime_seconds {uptime}",
@@ -892,29 +1056,22 @@ async def prometheus_metrics():
     ]
     for path, count in request_metrics["endpoint_hits"].items():
         safe = str(path).replace('"', "")
-        metrics_payload.append(
-            f'doc_intelligence_endpoint_hits_total{{path="{safe}"}} {count}'
-        )
+        legacy.append(f'doc_intelligence_endpoint_hits_total{{path="{safe}"}} {count}')
     for code, count in request_metrics["status_code_counts"].items():
-        metrics_payload.append(
-            f'doc_intelligence_status_code_total{{code="{code}"}} {count}'
-        )
+        legacy.append(f'doc_intelligence_status_code_total{{code="{code}"}} {count}')
+    chunks.append("\n".join(legacy))
 
     if _get_telemetry is not None:
         try:
-            metrics_payload.append(_get_telemetry().prometheus_lines().rstrip())
+            chunks.append(_get_telemetry().prometheus_lines().rstrip())
         except Exception:
             pass
 
-    # Append rag_* histograms/counters registered by backend.observability.metrics
-    if _generate_latest is not None:
-        metrics_payload.append(_generate_latest().decode("utf-8").rstrip())
-
-    return "\n".join(metrics_payload) + "\n"
+    return "\n".join(chunks) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# RAG fallback
+# RAG / document stubs when routers missing
 # ---------------------------------------------------------------------------
 if rag_router is None:
 
@@ -937,9 +1094,6 @@ if rag_router is None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Document stubs (only when real routers missing)
-# ---------------------------------------------------------------------------
 if ingestion_router is None:
 
     @app.post(

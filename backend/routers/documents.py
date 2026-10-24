@@ -1,38 +1,24 @@
 """
-Document management API — list / get / delete ingested docs in Qdrant.
+Document management API — list / get / upload / delete ingested docs in Qdrant.
 
 Routes:
   GET    /api/v1/documents
+  POST   /api/v1/documents/upload
   GET    /api/v1/documents/{document_id}
   DELETE /api/v1/documents/{document_id}
 
-Query params (list):
-  q              — search filename / snippet / id
-  limit          — page size (1–500, default 50)
-  offset         — skip N documents (default 0)
-  status         — filter status (indexed, quarantined, …)
-  department     — payload metadata.department
-  tag            — tag must be in payload tags list
-  security       — "passed" | "failed" | "unknown"
-  sort           — uploaded_at | filename | chunks  (default uploaded_at)
-  order          — desc | asc (default desc)
-
-Compatible with frontend DocumentManager + apiClient.deleteDocument.
+Compatible with frontend DocumentManager + DocumentUpload + apiClient.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Literal
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-
-from backend.security.dependencies import (
-    verify_and_get_tenant_id,
-    verify_enterprise_api_key,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +27,22 @@ router = APIRouter(prefix="/api/v1/documents", tags=["Document Management"])
 COLLECTION = os.getenv("QDRANT_COLLECTION") or os.getenv(
     "QDRANT_COLLECTION_NAME", "document_intelligence"
 )
-SCROLL_PAGE = int(os.getenv("DOCUMENTS_SCROLL_PAGE", "100"))
-SCROLL_MAX = int(os.getenv("DOCUMENTS_SCROLL_MAX", "5000"))
+SCROLL_BATCH = int(os.getenv("DOCUMENTS_SCROLL_BATCH", "256"))
+SCROLL_MAX_POINTS = int(os.getenv("DOCUMENTS_SCROLL_MAX", "5000"))
+MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+ALLOWED_EXT = {
+    ".txt",
+    ".md",
+    ".pdf",
+    ".docx",
+    ".doc",
+    ".html",
+    ".htm",
+    ".csv",
+    ".json",
+    ".log",
+    ".xlsx",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -61,18 +61,27 @@ class DocumentSummary(BaseModel):
     security_scan_passed: bool | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     uploaded_at: float | str | None = None
-    tags: list[str] = Field(default_factory=list)
-    department: str | None = None
 
 
 class DocumentListResponse(BaseModel):
     documents: list[DocumentSummary]
     total: int
-    limit: int
-    offset: int
-    has_more: bool = False
+    offset: int = 0
+    limit: int = 50
     collection: str = COLLECTION
-    filters_applied: dict[str, Any] = Field(default_factory=dict)
+
+
+class UploadResponse(BaseModel):
+    document_id: str
+    filename: str
+    status: str
+    security_scan_passed: bool
+    message: str
+    chunks_upserted: int = 0
+    warnings: list[str] = Field(default_factory=list)
+    char_count: int = 0
+    processing_time_ms: float = 0.0
+    collection: str | None = None
 
 
 class DeleteResponse(BaseModel):
@@ -87,107 +96,90 @@ class DeleteResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _client():
+def _payload_doc_id(payload: dict[str, Any], point_id: Any = "") -> str:
+    for key in ("document_id", "doc_id"):
+        val = payload.get(key)
+        if val:
+            return str(val)
+    chunk_id = payload.get("chunk_id")
+    if isinstance(chunk_id, str) and ":" in chunk_id:
+        return chunk_id.rsplit(":", 1)[0]
+    return str(point_id) if point_id else ""
+
+
+def _payload_filename(payload: dict[str, Any]) -> str:
+    for key in ("filename", "file_name", "source_file", "title"):
+        val = payload.get(key)
+        if val:
+            return str(val)
+    return "unknown"
+
+
+def _snippet(payload: dict[str, Any], max_len: int = 180) -> str:
+    text = (
+        payload.get("text")
+        or payload.get("content")
+        or payload.get("chunk_text")
+        or ""
+    )
+    text = str(text).strip().replace("\n", " ")
+    if len(text) > max_len:
+        return text[: max_len - 1] + "…"
+    return text
+
+
+async def _get_client():
     from backend.db.qdrant import get_qdrant_client
 
     return await get_qdrant_client()
 
 
-def _payload_doc_id(payload: dict[str, Any], point_id: Any) -> str:
-    for key in ("document_id", "doc_id", "source_id"):
-        val = payload.get(key)
-        if val is not None and str(val).strip():
-            return str(val)
-    return str(point_id)
-
-
-def _payload_filename(payload: dict[str, Any]) -> str:
-    for key in ("filename", "file_name", "source_file", "title", "source"):
-        val = payload.get(key)
-        if val is not None and str(val).strip():
-            return str(val)
-    return "document"
-
-
-def _payload_text(payload: dict[str, Any]) -> str:
-    for key in ("text", "content", "chunk_text", "snippet"):
-        val = payload.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return ""
-
-
-def _payload_tags(payload: dict[str, Any]) -> list[str]:
-    tags = payload.get("tags")
-    if isinstance(tags, list):
-        return [str(t).strip() for t in tags if str(t).strip()]
-    if isinstance(tags, str) and tags.strip():
-        return [t.strip() for t in tags.split(",") if t.strip()]
-    return []
-
-
 async def _scroll_all_points(
-    tenant_id: str | None = None,
-    limit_per_page: int = SCROLL_PAGE,
-    max_points: int = SCROLL_MAX,
+    *,
+    document_id: str | None = None,
 ) -> list[Any]:
-    """Scroll collection points (payload only). Caps at max_points.
-    Optionally applies tenant_id payload filter.
-    """
+    """Scroll points (optionally filtered by document_id). Caps at SCROLL_MAX_POINTS."""
     from qdrant_client.http import models as qm
 
-    client = await _client()
-    points: list[Any] = []
-    next_offset: Any = None
-
-    # Construct Qdrant filter if tenant_id is provided
-    scroll_filter = None
-    if tenant_id:
-        scroll_filter = qm.Filter(
-            must=[
+    client = await _get_client()
+    qfilter = None
+    if document_id:
+        qfilter = qm.Filter(
+            should=[
                 qm.FieldCondition(
-                    key="tenant_id",
-                    match=qm.MatchValue(value=tenant_id),
-                )
+                    key="document_id",
+                    match=qm.MatchValue(value=document_id),
+                ),
+                qm.FieldCondition(
+                    key="doc_id",
+                    match=qm.MatchValue(value=document_id),
+                ),
             ]
         )
 
-    while len(points) < max_points:
-        kwargs: dict[str, Any] = {
-            "collection_name": COLLECTION,
-            "limit": min(limit_per_page, max_points - len(points)),
-            "with_payload": True,
-            "with_vectors": False,
-        }
-        if scroll_filter:
-            kwargs["scroll_filter"] = scroll_filter
-        if next_offset is not None:
-            kwargs["offset"] = next_offset
-
+    points: list[Any] = []
+    offset: Any = None
+    while len(points) < SCROLL_MAX_POINTS:
         try:
-            result = await client.scroll(**kwargs)
+            batch, next_offset = await client.scroll(
+                collection_name=COLLECTION,
+                scroll_filter=qfilter,
+                limit=min(SCROLL_BATCH, SCROLL_MAX_POINTS - len(points)),
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
         except Exception as exc:
             logger.exception("Qdrant scroll failed")
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Qdrant scroll failed: {exc}",
+                detail=f"Vector store unavailable: {exc}",
             ) from exc
 
-        batch = (
-            result[0]
-            if isinstance(result, tuple)
-            else getattr(result, "points", result)
-        )
-        batch = list(batch or [])
-        points.extend(batch)
-
-        next_offset = (
-            result[1]
-            if isinstance(result, tuple)
-            else getattr(result, "next_page_offset", None)
-        )
-        if not batch or next_offset is None:
+        points.extend(batch or [])
+        if next_offset is None or not batch:
             break
+        offset = next_offset
 
     return points
 
@@ -199,343 +191,337 @@ def _group_documents(points: list[Any]) -> list[DocumentSummary]:
         payload = getattr(p, "payload", None) or {}
         if not isinstance(payload, dict):
             payload = {}
-        pid = getattr(p, "id", None)
-        doc_id = _payload_doc_id(payload, pid)
-        text = _payload_text(payload)
-        filename = _payload_filename(payload)
-        tags = _payload_tags(payload)
-        department = payload.get("department")
-        if department is not None:
-            department = str(department)
+        doc_id = _payload_doc_id(payload, getattr(p, "id", ""))
+        if not doc_id:
+            continue
 
-        if doc_id not in groups:
-            meta = {
-                k: payload.get(k)
-                for k in (
-                    "source",
-                    "department",
-                    "page",
-                    "mime_type",
-                    "title",
-                    "request_id",
-                )
-                if payload.get(k) is not None
-            }
-            if tags:
-                meta["tags"] = tags
+        g = groups.get(doc_id)
+        if g is None:
+            uploaded = payload.get("uploaded_at") or payload.get("ingested_at")
+            sec = payload.get("security_scan_passed")
+            if sec is not None:
+                sec = bool(sec)
             groups[doc_id] = {
                 "id": doc_id,
                 "document_id": doc_id,
-                "filename": filename,
-                "text_snippet": text[:240],
+                "filename": _payload_filename(payload),
+                "text_snippet": _snippet(payload),
                 "status": str(payload.get("status") or "indexed"),
-                "chunks": 0,
-                "security_scan_passed": payload.get("security_scan_passed"),
-                "metadata": meta,
-                "uploaded_at": payload.get("uploaded_at")
-                or payload.get("created_at")
-                or payload.get("ingested_at"),
-                "tags": tags,
-                "department": department,
+                "chunks": 1,
+                "security_scan_passed": sec,
+                "uploaded_at": uploaded,
+                "metadata": {
+                    k: v
+                    for k, v in payload.items()
+                    if k
+                    not in {
+                        "text",
+                        "content",
+                        "chunk_text",
+                        "document_id",
+                        "doc_id",
+                        "chunk_id",
+                        "chunk_index",
+                        "vector",
+                    }
+                },
             }
+        else:
+            g["chunks"] += 1
+            if not g.get("text_snippet"):
+                g["text_snippet"] = _snippet(payload)
+            if not g.get("filename") or g["filename"] == "unknown":
+                g["filename"] = _payload_filename(payload)
+            if g.get("uploaded_at") is None:
+                g["uploaded_at"] = payload.get("uploaded_at") or payload.get(
+                    "ingested_at"
+                )
+            if g.get("security_scan_passed") is None and payload.get(
+                "security_scan_passed"
+            ) is not None:
+                g["security_scan_passed"] = bool(
+                    payload.get("security_scan_passed")
+                )
 
-        groups[doc_id]["chunks"] += 1
-        if len(text) > len(groups[doc_id].get("text_snippet") or ""):
-            groups[doc_id]["text_snippet"] = text[:240]
-        if filename and groups[doc_id]["filename"] == "document":
-            groups[doc_id]["filename"] = filename
-        # merge tags
-        existing = set(groups[doc_id].get("tags") or [])
-        existing.update(tags)
-        groups[doc_id]["tags"] = sorted(existing)
-
-    out: list[DocumentSummary] = []
+    docs: list[DocumentSummary] = []
     for g in groups.values():
-        n = int(g["chunks"])
-        out.append(
+        n = int(g.get("chunks") or 0)
+        docs.append(
             DocumentSummary(
-                id=g["id"],
-                document_id=g["document_id"],
-                filename=g["filename"],
-                text_snippet=g.get("text_snippet") or "",
-                status=g.get("status") or "indexed",
+                id=str(g["id"]),
+                document_id=str(g["document_id"]),
+                filename=str(g.get("filename") or "unknown"),
+                text_snippet=str(g.get("text_snippet") or ""),
+                status=str(g.get("status") or "indexed"),
                 chunks=n,
                 chunks_upserted=n,
                 security_scan_passed=g.get("security_scan_passed"),
-                metadata=g.get("metadata") or {},
+                metadata=dict(g.get("metadata") or {}),
                 uploaded_at=g.get("uploaded_at"),
-                tags=list(g.get("tags") or []),
-                department=g.get("department"),
             )
         )
-    return out
 
+    def sort_key(d: DocumentSummary) -> float:
+        u = d.uploaded_at
+        if isinstance(u, (int, float)):
+            return float(u)
+        try:
+            return float(u)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
 
-def _sort_key_uploaded(d: DocumentSummary) -> float:
-    u = d.uploaded_at
-    try:
-        return float(u) if u is not None else 0.0
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _apply_filters(
-    docs: list[DocumentSummary],
-    *,
-    q: str | None,
-    status_filter: str | None,
-    department: str | None,
-    tag: str | None,
-    security: str | None,
-) -> list[DocumentSummary]:
-    result = docs
-
-    if q and q.strip():
-        needle = q.strip().lower()
-        result = [
-            d
-            for d in result
-            if needle in d.filename.lower()
-            or needle in (d.text_snippet or "").lower()
-            or needle in d.document_id.lower()
-            or any(needle in t.lower() for t in d.tags)
-        ]
-
-    if status_filter and status_filter.strip():
-        st = status_filter.strip().lower()
-        result = [d for d in result if (d.status or "").lower() == st]
-
-    if department and department.strip():
-        dep = department.strip().lower()
-        result = [
-            d
-            for d in result
-            if (d.department or "").lower() == dep
-            or str((d.metadata or {}).get("department") or "").lower() == dep
-        ]
-
-    if tag and tag.strip():
-        tneedle = tag.strip().lower()
-        result = [
-            d
-            for d in result
-            if any(tneedle == t.lower() or tneedle in t.lower() for t in d.tags)
-        ]
-
-    if security:
-        sec = security.strip().lower()
-        if sec == "passed":
-            result = [d for d in result if d.security_scan_passed is True]
-        elif sec == "failed":
-            result = [d for d in result if d.security_scan_passed is False]
-        elif sec == "unknown":
-            result = [d for d in result if d.security_scan_passed is None]
-
-    return result
-
-
-def _sort_docs(
-    docs: list[DocumentSummary],
-    sort: str,
-    order: str,
-) -> list[DocumentSummary]:
-    reverse = order.lower() != "asc"
-    if sort == "filename":
-        return sorted(docs, key=lambda d: (d.filename or "").lower(), reverse=reverse)
-    if sort == "chunks":
-        return sorted(docs, key=lambda d: d.chunks or 0, reverse=reverse)
-    # default uploaded_at
-    return sorted(docs, key=_sort_key_uploaded, reverse=reverse)
-
-
-async def _count_points_for_doc(document_id: str, tenant_id: str | None = None) -> int:
-    """Best-effort count before delete."""
-    points = await _scroll_all_points(tenant_id=tenant_id)
-    n = 0
-    for p in points:
-        payload = getattr(p, "payload", None) or {}
-        if not isinstance(payload, dict):
-            continue
-        if _payload_doc_id(payload, getattr(p, "id", "")) == document_id:
-            n += 1
-    return n
+    docs.sort(key=sort_key, reverse=True)
+    return docs
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — static paths before /{document_id}
 # ---------------------------------------------------------------------------
 
 
-@router.get("", response_model=DocumentListResponse)
-@router.get("/", response_model=DocumentListResponse)
+@router.get(
+    "",
+    response_model=DocumentListResponse,
+    summary="List ingested documents (grouped by document_id)",
+)
 async def list_documents(
-    q: str | None = Query(None, description="Search filename, snippet, id, tags"),
-    limit: int = Query(50, ge=1, le=500, description="Page size"),
-    offset: int = Query(0, ge=0, description="Skip N documents"),
-    status_filter: str | None = Query(
-        None, alias="status", description="Filter by status"
-    ),
-    department: str | None = Query(None, description="Filter by department metadata"),
-    tag: str | None = Query(None, description="Filter by tag"),
-    security: Literal["passed", "failed", "unknown"] | None = Query(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    q: str | None = Query(None, description="Search filename or snippet"),
+    status_filter: str | None = Query(None, alias="status"),
+    security_passed: bool | None = Query(
         None, description="Filter by security_scan_passed"
     ),
-    sort: Literal["uploaded_at", "filename", "chunks"] = Query("uploaded_at"),
-    order: Literal["asc", "desc"] = Query("desc"),
-    tenant_id: str = Depends(verify_and_get_tenant_id),
-    api_key: str = Depends(verify_enterprise_api_key),
 ) -> DocumentListResponse:
-    points = await _scroll_all_points(tenant_id=tenant_id)
+    points = await _scroll_all_points()
     docs = _group_documents(points)
-    docs = _apply_filters(
-        docs,
-        q=q,
-        status_filter=status_filter,
-        department=department,
-        tag=tag,
-        security=security,
-    )
-    docs = _sort_docs(docs, sort=sort, order=order)
+
+    if status_filter:
+        sf = status_filter.strip().lower()
+        docs = [d for d in docs if d.status.lower() == sf]
+
+    if security_passed is not None:
+        docs = [
+            d
+            for d in docs
+            if d.security_scan_passed is not None
+            and bool(d.security_scan_passed) is security_passed
+        ]
+
+    if q:
+        needle = q.strip().lower()
+        docs = [
+            d
+            for d in docs
+            if needle in d.filename.lower()
+            or needle in d.text_snippet.lower()
+            or needle in d.document_id.lower()
+        ]
 
     total = len(docs)
     page = docs[offset : offset + limit]
-    filters_applied = {
-        k: v
-        for k, v in {
-            "q": q,
-            "status": status_filter,
-            "department": department,
-            "tag": tag,
-            "security": security,
-            "sort": sort,
-            "order": order,
-            "tenant_id": tenant_id,
-        }.items()
-        if v is not None and v != ""
-    }
-
     return DocumentListResponse(
         documents=page,
         total=total,
-        limit=limit,
         offset=offset,
-        has_more=(offset + limit) < total,
+        limit=limit,
         collection=COLLECTION,
-        filters_applied=filters_applied,
     )
 
 
-@router.get("/{document_id}", response_model=DocumentSummary)
-async def get_document(
-    document_id: str,
-    tenant_id: str = Depends(verify_and_get_tenant_id),
-    api_key: str = Depends(verify_enterprise_api_key),
-) -> DocumentSummary:
-    document_id = (document_id or "").strip()
-    if not document_id:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid document_id")
+@router.post(
+    "/upload",
+    response_model=UploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload and ingest a document into Qdrant",
+)
+async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
+    """
+    Multipart upload → security scan → extract → chunk → embed → upsert.
+    Status: indexed (201), quarantined (200), failed (422).
+    """
+    filename = file.filename or "upload.bin"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext and ext not in ALLOWED_EXT:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported file type '{ext}'. "
+                f"Allowed: {sorted(ALLOWED_EXT)}"
+            ),
+        )
 
-    points = await _scroll_all_points(tenant_id=tenant_id)
-    docs = _group_documents(points)
-    for d in docs:
-        if d.document_id == document_id or d.id == document_id:
-            return d
-    raise HTTPException(
-        status.HTTP_404_NOT_FOUND,
-        detail=f"Document '{document_id}' not found for tenant '{tenant_id}'",
-    )
-
-
-@router.delete("/{document_id}", response_model=DeleteResponse)
-async def delete_document(
-    document_id: str,
-    tenant_id: str = Depends(verify_and_get_tenant_id),
-    api_key: str = Depends(verify_enterprise_api_key),
-) -> DeleteResponse:
-    """Delete all Qdrant points for this document_id (payload filter + tenant isolation)."""
-    from qdrant_client.http import models as qm
-
-    document_id = (document_id or "").strip()
-    if not document_id or len(document_id) > 80:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid document_id")
-
-    client = await _client()
-    points_deleted = 0
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Empty file.")
+    if len(raw) > MAX_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds {MAX_BYTES} bytes.",
+        )
 
     try:
-        # Count first for a useful response
+        from backend.services.ingest_service import ingest_bytes
+
+        result = await ingest_bytes(filename, raw)
+    except Exception as exc:
+        logger.exception("upload failed")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ingest failed: {exc}",
+        ) from exc
+
+    body = UploadResponse(
+        document_id=result.document_id,
+        filename=result.filename,
+        status=result.status,
+        security_scan_passed=result.security_scan_passed,
+        message=result.message,
+        chunks_upserted=getattr(result, "chunks_upserted", 0) or 0,
+        warnings=list(getattr(result, "warnings", None) or []),
+        char_count=getattr(result, "char_count", 0) or 0,
+        processing_time_ms=float(
+            getattr(result, "processing_time_ms", 0.0) or 0.0
+        ),
+        collection=getattr(result, "collection", None) or COLLECTION,
+    )
+
+    if result.status == "failed":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": result.message,
+                "document_id": result.document_id,
+                "warnings": body.warnings,
+            },
+        )
+
+    http_status = (
+        status.HTTP_200_OK
+        if result.status == "quarantined"
+        else status.HTTP_201_CREATED
+    )
+    return JSONResponse(status_code=http_status, content=body.model_dump())
+
+
+@router.get(
+    "/{document_id}",
+    response_model=DocumentSummary,
+    summary="Get one document summary by document_id",
+)
+async def get_document(document_id: str) -> DocumentSummary:
+    document_id = (document_id or "").strip()
+    if not document_id or len(document_id) > 80:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="Invalid document_id."
+        )
+
+    points = await _scroll_all_points(document_id=document_id)
+    docs = _group_documents(points)
+    if not docs:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"Document '{document_id}' not found in vector store",
+        )
+    return docs[0]
+
+
+@router.delete(
+    "/{document_id}",
+    response_model=DeleteResponse,
+    summary="Delete all vector chunks for a document_id",
+)
+async def delete_document(document_id: str) -> DeleteResponse:
+    document_id = (document_id or "").strip()
+    if not document_id or len(document_id) > 80:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="Invalid document_id."
+        )
+
+    from qdrant_client.http import models as qm
+
+    client = await _get_client()
+    points_deleted = 0
+    filename: str | None = None
+
+    try:
+        existing = await _scroll_all_points(document_id=document_id)
+        if existing:
+            payload = getattr(existing[0], "payload", None) or {}
+            if isinstance(payload, dict):
+                filename = _payload_filename(payload)
+            points_deleted = len(existing)
+    except Exception:
+        pass
+
+    deleted_via_filter = False
+    for key in ("document_id", "doc_id"):
         try:
-            points_deleted = await _count_points_for_doc(
-                document_id, tenant_id=tenant_id
+            await client.delete(
+                collection_name=COLLECTION,
+                points_selector=qm.FilterSelector(
+                    filter=qm.Filter(
+                        must=[
+                            qm.FieldCondition(
+                                key=key,
+                                match=qm.MatchValue(value=document_id),
+                            )
+                        ]
+                    )
+                ),
             )
-        except Exception:
-            points_deleted = 0
+            deleted_via_filter = True
+            break
+        except Exception as filter_exc:
+            logger.debug(
+                "Filter delete with key=%s failed: %s", key, filter_exc
+            )
+            continue
 
-        deleted_via_filter = False
-        for key in ("document_id", "doc_id"):
-            try:
-                must_conditions = [
-                    qm.FieldCondition(
-                        key=key,
-                        match=qm.MatchValue(value=document_id),
-                    )
-                ]
-                if tenant_id:
-                    must_conditions.append(
-                        qm.FieldCondition(
-                            key="tenant_id",
-                            match=qm.MatchValue(value=tenant_id),
-                        )
-                    )
-
-                await client.delete(
-                    collection_name=COLLECTION,
-                    points_selector=qm.FilterSelector(
-                        filter=qm.Filter(must=must_conditions)
-                    ),
-                )
-                deleted_via_filter = True
-                break
-            except Exception as filter_exc:
-                logger.debug(
-                    "Filter delete with key=%s failed: %s", key, filter_exc
-                )
-                continue
-
-        if not deleted_via_filter:
-            points = await _scroll_all_points(tenant_id=tenant_id)
-            ids: list[Any] = []
-            for p in points:
-                payload = getattr(p, "payload", None) or {}
-                if not isinstance(payload, dict):
-                    continue
-                if _payload_doc_id(payload, getattr(p, "id", "")) == document_id:
-                    ids.append(getattr(p, "id"))
-            if not ids:
-                raise HTTPException(
-                    status.HTTP_404_NOT_FOUND,
-                    detail=f"Document '{document_id}' not found in vector store for tenant '{tenant_id}'",
-                )
+    if not deleted_via_filter:
+        points = await _scroll_all_points(document_id=document_id)
+        ids: list[Any] = [
+            getattr(p, "id") for p in points if getattr(p, "id", None)
+        ]
+        if not ids:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                detail=f"Document '{document_id}' not found in vector store",
+            )
+        try:
             await client.delete(
                 collection_name=COLLECTION,
                 points_selector=qm.PointIdsList(points=ids),
             )
             points_deleted = len(ids)
-        elif points_deleted == 0:
-            points_deleted = 0
+        except Exception as exc:
+            logger.exception("delete document failed")
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Delete failed: {exc}",
+            ) from exc
 
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("delete document failed")
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Delete failed: {exc}",
-        ) from exc
+    try:
+        from backend.security.event_publish import emit_document_deleted
+
+        emit_document_deleted(
+            document_id=document_id,
+            filename=filename,
+            points_deleted=points_deleted or None,
+        )
+    except Exception:
+        logger.debug("emit_document_deleted failed", exc_info=True)
+
+    try:
+        from backend.services.ingest_service import delete_document_vectors
+
+        await delete_document_vectors(document_id)
+    except Exception:
+        pass
 
     return DeleteResponse(
         status="deleted",
         document_id=document_id,
         points_deleted=max(points_deleted, 0),
-        message=f"Removed vector points for document_id={document_id} under tenant={tenant_id}",
+        message=f"Removed vector points for document_id={document_id}",
     )

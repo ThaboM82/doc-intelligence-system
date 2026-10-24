@@ -1,6 +1,6 @@
 """
 backend/services/embeddings.py
-──────────────────────────────
+
 Shared text → vector helpers for RAG search and document ingest.
 
 Same model + dimension must be used for:
@@ -10,7 +10,8 @@ Same model + dimension must be used for:
 
 Default: OpenAI text-embedding-3-small → 1536-d (cosine in Qdrant).
 
-Env:
+Env
+---
   OPENAI_API_KEY
   OPENAI_EMBED_MODEL        default text-embedding-3-small
   QDRANT_VECTOR_SIZE        default 1536
@@ -31,8 +32,7 @@ import os
 import struct
 import time
 from collections import OrderedDict
-from typing import Sequence
-from backend.observability.cost import get_cost_tracker
+from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +42,12 @@ logger = logging.getLogger(__name__)
 
 VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", "1536"))
 EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
-EMBED_MAX_CHARS = int(os.getenv("EMBED_MAX_CHARS", "30000"))
-EMBED_MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES", "3"))
+EMBED_BATCH_SIZE = max(1, int(os.getenv("EMBED_BATCH_SIZE", "16")))
+EMBED_MAX_CHARS = max(256, int(os.getenv("EMBED_MAX_CHARS", "30000")))
+EMBED_MAX_RETRIES = max(0, int(os.getenv("EMBED_MAX_RETRIES", "3")))
 EMBED_RETRY_BASE_SEC = float(os.getenv("EMBED_RETRY_BASE_SEC", "0.8"))
 ALLOW_MOCK = os.getenv("EMBED_ALLOW_MOCK", "false").lower() in ("1", "true", "yes")
-CACHE_SIZE = int(os.getenv("EMBED_CACHE_SIZE", "256"))
+CACHE_SIZE = max(0, int(os.getenv("EMBED_CACHE_SIZE", "256")))
 
 
 class EmbeddingError(RuntimeError):
@@ -55,8 +55,9 @@ class EmbeddingError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Small in-process LRU (optional speed-up for repeated queries)
+# In-process LRU
 # ---------------------------------------------------------------------------
+
 
 class _EmbedCache:
     def __init__(self, maxsize: int) -> None:
@@ -66,7 +67,6 @@ class _EmbedCache:
         self.misses = 0
 
     def _key(self, text: str) -> str:
-        # Include model + dim so env changes don't serve stale vectors
         raw = f"{EMBED_MODEL}|{VECTOR_SIZE}|{text}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -110,6 +110,7 @@ _cache = _EmbedCache(CACHE_SIZE)
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
 
 def _require_api_key() -> str:
     key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -165,43 +166,74 @@ def _truncate(text: str) -> str:
     return t
 
 
+def _record_usage(tokens: int, seconds: float) -> None:
+    """Soft-fail metrics + cost."""
+    try:
+        from backend.observability.metrics import (
+            observe_stage,
+            record_cost,
+            record_tokens,
+        )
+
+        observe_stage("embed", seconds)
+        if tokens:
+            record_tokens(EMBED_MODEL, "embedding", tokens)
+            try:
+                from backend.observability.cost import embed_cost
+
+                record_cost(EMBED_MODEL, embed_cost(EMBED_MODEL, tokens))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        from backend.observability.cost import get_cost_tracker
+
+        get_cost_tracker().record_embed(EMBED_MODEL, tokens, route="/emb")
+    except Exception:
+        pass
+
+
 def _openai_embed_sync(texts: Sequence[str]) -> list[list[float]]:
-    """
-    Blocking OpenAI batch call with simple retries on rate limits / transient errors.
-    """
+    """Blocking OpenAI batch call with retries on rate limits / transient errors."""
     from openai import OpenAI
 
     client = OpenAI(api_key=_require_api_key())
     cleaned = [_truncate(t) for t in texts]
     last_exc: Exception | None = None
+    t0 = time.perf_counter()
 
     for attempt in range(EMBED_MAX_RETRIES + 1):
         try:
             response = client.embeddings.create(input=cleaned, model=EMBED_MODEL)
             ordered = sorted(response.data, key=lambda item: item.index)
-            vectors = [_validate_dim(list(item.embedding), context=f"idx={item.index}") for item in ordered]
-            
-            # Record token costs via observability cost tracker
-            if hasattr(response, "usage") and response.usage:
-                tokens = getattr(response.usage, "total_tokens", 0)
-                try:
-                    get_cost_tracker().record_embed(EMBED_MODEL, tokens, route="/emb")
-                except Exception:
-                    pass
-
+            vectors = [
+                _validate_dim(list(item.embedding), context=f"idx={item.index}")
+                for item in ordered
+            ]
+            tokens = 0
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                tokens = int(getattr(usage, "total_tokens", 0) or 0)
+            _record_usage(tokens, time.perf_counter() - t0)
             return vectors
         except Exception as exc:
             last_exc = exc
             name = type(exc).__name__
             msg = str(exc).lower()
-            retryable = (
-                "rate" in msg
-                or "timeout" in msg
-                or "429" in msg
-                or "500" in msg
-                or "502" in msg
-                or "503" in msg
-                or "529" in msg
+            retryable = any(
+                s in msg
+                for s in (
+                    "rate",
+                    "timeout",
+                    "429",
+                    "500",
+                    "502",
+                    "503",
+                    "529",
+                    "temporarily",
+                )
             )
             if attempt >= EMBED_MAX_RETRIES or not retryable:
                 break
@@ -215,6 +247,12 @@ def _openai_embed_sync(texts: Sequence[str]) -> list[list[float]]:
             )
             time.sleep(delay)
 
+    try:
+        from backend.observability.metrics import record_error
+
+        record_error("embeddings")
+    except Exception:
+        pass
     raise EmbeddingError(f"OpenAI embedding failed: {last_exc}") from last_exc
 
 
@@ -226,12 +264,9 @@ def _openai_embed_one_sync(text: str) -> list[float]:
 # Public async API
 # ---------------------------------------------------------------------------
 
-async def embed_query(text: str, *, use_cache: bool = True) -> list[float]:
-    """
-    Embed a single query or chunk (async).
 
-    Raises EmbeddingError on empty input or API failure.
-    """
+async def embed_query(text: str, *, use_cache: bool = True) -> list[float]:
+    """Embed a single query or chunk. Raises EmbeddingError on failure."""
     text = (text or "").strip()
     if not text:
         raise EmbeddingError("Empty text for embedding")
@@ -260,11 +295,7 @@ async def embed_texts(
     *,
     use_cache: bool = True,
 ) -> list[list[float]]:
-    """
-    Embed many strings with batching. Order preserved.
-
-    Cached strings are skipped in the API call and merged back in order.
-    """
+    """Embed many strings with batching. Order preserved."""
     if not texts:
         return []
 
@@ -283,7 +314,7 @@ async def embed_texts(
         pending_txt.append(t)
 
     if not pending_txt:
-        return [v for v in results if v is not None]  # all cached
+        return [v for v in results if v is not None]
 
     if not os.getenv("OPENAI_API_KEY", "").strip():
         if ALLOW_MOCK:
@@ -295,10 +326,9 @@ async def embed_texts(
             return [v if v is not None else _mock_embed(" ") for v in results]
         raise EmbeddingError("OPENAI_API_KEY is required for embeddings")
 
-    batch_size = max(1, EMBED_BATCH_SIZE)
-    for offset in range(0, len(pending_txt), batch_size):
-        batch = pending_txt[offset : offset + batch_size]
-        batch_indices = pending_idx[offset : offset + batch_size]
+    for offset in range(0, len(pending_txt), EMBED_BATCH_SIZE):
+        batch = pending_txt[offset : offset + EMBED_BATCH_SIZE]
+        batch_indices = pending_idx[offset : offset + EMBED_BATCH_SIZE]
         try:
             vectors = await asyncio.to_thread(_openai_embed_sync, batch)
         except EmbeddingError:
@@ -333,11 +363,20 @@ async def embed_query_safe(text: str) -> list[float] | None:
         return None
 
 
+def vector_size() -> int:
+    """Dimension expected by Qdrant (from QDRANT_VECTOR_SIZE)."""
+    return VECTOR_SIZE
+
+
+def embedding_model() -> str:
+    return EMBED_MODEL
+
+
 def clear_embed_cache() -> None:
     _cache.clear()
 
 
-def embedding_config() -> dict[str, object]:
+def embedding_config() -> dict[str, Any]:
     """Diagnostics for health/admin (never exposes the API key)."""
     return {
         "model": EMBED_MODEL,
@@ -349,3 +388,21 @@ def embedding_config() -> dict[str, object]:
         "allow_mock": ALLOW_MOCK,
         "cache": _cache.stats(),
     }
+
+
+embed_documents = embed_texts
+
+
+__all__ = [
+    "EmbeddingError",
+    "VECTOR_SIZE",
+    "EMBED_MODEL",
+    "embed_query",
+    "embed_texts",
+    "embed_documents",
+    "embed_query_safe",
+    "vector_size",
+    "embedding_model",
+    "clear_embed_cache",
+    "embedding_config",
+]

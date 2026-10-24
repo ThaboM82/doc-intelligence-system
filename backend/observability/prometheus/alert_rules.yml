@@ -1,27 +1,292 @@
 groups:
+
+  # ==========================================================================
+  # Cost Monitoring
+  # ==========================================================================
+
   - name: rag-cost
     rules:
+
       - alert: RagCostSpike
-        # > $0.10/hour sustained. Calibrate to your real traffic: check
-        # rate(rag_cost_dollars_total[1h]) * 3600 on the dashboard first.
         expr: rate(rag_cost_dollars_total[1h]) * 3600 > 0.10
         for: 15m
         labels:
           severity: warning
           team: rag
+          service: doc-intelligence
         annotations:
-          summary: "RAG spend above ${{ $value | humanize }}/hour"
-          description: "Estimated LLM spend is ${{ $value | humanize }}/h (threshold $0.10/h). Possible runaway loop, prompt blowup, or scraping. Check rag_tokens_total breakdown by model."
+          summary: "RAG spend above {{ $value | humanize }}/hour"
+          description: >
+            Estimated LLM spend is {{ $value | humanize }}/h
+            (threshold $0.10/h).
+
+            Possible causes:
+            - runaway retrieval loops
+            - excessive prompt expansion
+            - malformed automation
+            - unexpected scraping traffic
+
+            Review:
+            - rag_tokens_total
+            - rag_cost_dollars_total
+            - record_rag_turn()
+            - record_cost()
+
+      - alert: RagCostCritical
+        expr: rate(rag_cost_dollars_total[1h]) * 3600 > 1.00
+        for: 15m
+        labels:
+          severity: critical
+          team: rag
+          service: doc-intelligence
+        annotations:
+          summary: "Critical RAG spend rate"
+          description: >
+            Spending exceeds $1.00/hour.
+
+            Immediate investigation recommended.
+
+  # ==========================================================================
+  # Authentication & Rate Limiting
+  # ==========================================================================
 
   - name: rag-auth
     rules:
+
       - alert: RagRateLimitSpike
-        # > 0.5 rejected req/s sustained = someone hammering the API
-        expr: rate(rag_rate_limited_total[5m]) > 0.5
+        expr: rate(ops_rate_limit_hits_total[5m]) > 0.5
         for: 5m
         labels:
           severity: warning
           team: rag
+          service: doc-intelligence
         annotations:
           summary: "Rate limit rejections spiking ({{ $value }}/s)"
-          description: "Sustained 429 rejections. Possible abuse, misconfigured client retry loop, or RATE_LIMIT_MAX_REQUESTS too low for legit traffic."
+          description: >
+            Sustained rate-limit rejections detected.
+
+            Possible causes:
+            - abusive traffic
+            - bot activity
+            - retry storms
+            - incorrectly tuned limits
+
+            Review:
+            - OPS_RATE_LIMIT
+            - frontend retry behaviour
+            - API gateway settings
+
+      - alert: AuthenticationFailures
+        expr: rate(auth_failures_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+          team: security
+          service: doc-intelligence
+        annotations:
+          summary: "Authentication failures increasing"
+          description: >
+            Authentication failures have exceeded expected levels.
+
+            Possible brute-force activity or configuration issues.
+
+  # ==========================================================================
+  # RAG Quality
+  # ==========================================================================
+
+  - name: rag-quality
+    rules:
+
+      - alert: RetrievalFailureSpike
+        expr: rate(rag_retrieval_failures_total[10m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          team: rag
+          service: doc-intelligence
+        annotations:
+          summary: "Retrieval failures increasing"
+          description: >
+            Retrieval operations are failing more frequently.
+
+            Investigate:
+            - Qdrant connectivity
+            - retrieval orchestrator
+            - embedding generation
+
+      - alert: LowConfidenceAnswers
+        expr: rate(rag_low_confidence_answers_total[15m]) > 0.10
+        for: 15m
+        labels:
+          severity: warning
+          team: rag
+          service: doc-intelligence
+        annotations:
+          summary: "Low-confidence answer volume elevated"
+          description: >
+            Large percentage of answers are being returned
+            with low retrieval confidence.
+
+            Review:
+            - query rewriting
+            - retrieval ranking
+            - indexing quality
+
+  # ==========================================================================
+  # Vector Store
+  # ==========================================================================
+
+  - name: qdrant
+    rules:
+
+      - alert: QdrantUnavailable
+        expr: up{job="qdrant"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+          service: qdrant
+        annotations:
+          summary: "Qdrant unavailable"
+          description: >
+            Qdrant has been unreachable for more than 5 minutes.
+
+      - alert: QdrantHighLatency
+        expr: histogram_quantile(0.95, rate(qdrant_request_duration_seconds_bucket[5m])) > 2
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+          service: qdrant
+        annotations:
+          summary: "Qdrant latency elevated"
+          description: >
+            P95 latency exceeds 2 seconds.
+
+  # ==========================================================================
+  # Ingestion Pipeline
+  # ==========================================================================
+
+  - name: ingestion
+    rules:
+
+      - alert: IngestionFailureRate
+        expr: rate(ingestion_failures_total[10m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          team: ingestion
+          service: doc-intelligence
+        annotations:
+          summary: "Document ingestion failures detected"
+          description: >
+            Document ingestion failure rate exceeds threshold.
+
+            Review:
+            - extractors
+            - chunking
+            - embeddings
+
+      - alert: QuarantineSpike
+        expr: rate(security_quarantined_documents_total[15m]) > 0.10
+        for: 15m
+        labels:
+          severity: warning
+          team: security
+          service: doc-intelligence
+        annotations:
+          summary: "Quarantine volume increasing"
+          description: >
+            More documents than expected are being quarantined.
+
+            Review:
+            - DLP detections
+            - prompt injections
+            - policy thresholds
+
+  # ==========================================================================
+  # Security
+  # ==========================================================================
+
+  - name: security
+    rules:
+
+      - alert: PromptInjectionSpike
+        expr: rate(security_prompt_injections_total[10m]) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          team: security
+          service: doc-intelligence
+        annotations:
+          summary: "Prompt injection attempts detected"
+          description: >
+            Elevated prompt injection activity observed.
+
+      - alert: SecretExposureDetected
+        expr: increase(security_secret_exposures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: security
+          service: doc-intelligence
+        annotations:
+          summary: "Secret exposure detected"
+          description: >
+            A document containing a potential credential
+            or secret has been detected.
+
+      - alert: DLPViolationSpike
+        expr: rate(security_dlp_hits_total[15m]) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          team: security
+          service: doc-intelligence
+        annotations:
+          summary: "DLP detections increasing"
+          description: >
+            Elevated volume of PII or sensitive-data findings.
+
+  # ==========================================================================
+  # API Availability
+  # ==========================================================================
+
+  - name: api
+    rules:
+
+      - alert: ApiDown
+        expr: up{job="doc-intelligence-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+          service: doc-intelligence
+        annotations:
+          summary: "API unavailable"
+          description: >
+            FastAPI service has been unreachable for 2 minutes.
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+          service: doc-intelligence
+        annotations:
+          summary: "API 5xx error rate elevated"
+          description: >
+            Elevated server-error responses detected.
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 3
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+          service: doc-intelligence
+        annotations:
+          summary: "API latency elevated"
+          description: >
+            P95 request latency exceeds 3 seconds.

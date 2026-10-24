@@ -16,7 +16,7 @@ import {
   LogOut,
 } from 'lucide-react';
 import DocumentUpload from './components/DocumentUpload';
-import RAGChat from './components/RAGChat';
+import RAGChat from './components/Chat/RAGChat';
 import SecurityDashboard from './components/SecurityDashboard';
 import AdminDashboard from './components/AdminDashboard';
 import LoginForm from './components/LoginForm';

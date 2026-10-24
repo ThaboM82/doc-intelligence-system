@@ -3,8 +3,8 @@ HITL queue persistence.
 
 Backends
 --------
-* memory (default) — thread-safe in-process store
-* redis            — shared queue across workers/instances
+- memory (default) — thread-safe in-process store
+- redis            — shared queue across workers/instances
 
 Env
 ---
@@ -13,6 +13,7 @@ HITL_STORE_MAX_ITEMS   in-memory cap           (default: 5000)
 HITL_REDIS_URL         redis://... or rediss://
 HITL_REDIS_PREFIX      key prefix              (default: hitl:queue)
 HITL_REDIS_TTL_SEC     item TTL seconds, 0=off (default: 0)
+HITL_REDIS_SOCKET_TIMEOUT  seconds             (default: 5)
 
 Redis requires: pip install redis
 """
@@ -27,7 +28,7 @@ import uuid
 from abc import ABC, abstractmethod
 from enum import Enum
 from threading import Lock
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ _PRUNE_ORDER = (
     QueueStatus.modified.value,
 )
 
+_VALID_STATUS = frozenset(s.value for s in QueueStatus)
+
 
 def new_item_id() -> str:
     return str(uuid.uuid4())
@@ -62,6 +65,28 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Ensure required fields on every stored row."""
+    out = dict(item)
+    item_id = str(out.get("id") or new_item_id())
+    now = time.time()
+    out["id"] = item_id
+    out.setdefault("created_at", now)
+    out["updated_at"] = now
+    status = str(out.get("status") or QueueStatus.pending.value).lower()
+    if status not in _VALID_STATUS:
+        status = QueueStatus.pending.value
+    out["status"] = status
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +141,83 @@ class HitlStore(ABC):
     def exists(self, item_id: str) -> bool:
         return self.get(item_id) is not None
 
+    def get_many(self, item_ids: Iterable[str]) -> list[dict[str, Any]]:
+        """Fetch multiple items; skips missing ids."""
+        out: list[dict[str, Any]] = []
+        for iid in item_ids:
+            row = self.get(str(iid))
+            if row is not None:
+                out.append(row)
+        return out
+
+    def delete_many(self, item_ids: Iterable[str]) -> int:
+        n = 0
+        for iid in item_ids:
+            if self.delete(str(iid)):
+                n += 1
+        return n
+
+    def count(
+        self,
+        *,
+        status: str | None = None,
+        document_id: str | None = None,
+        source: str | None = None,
+    ) -> int:
+        _, total = self.list(
+            status=status,
+            document_id=document_id,
+            source=source,
+            limit=1,
+            offset=0,
+        )
+        return total
+
+    def claim_next_pending(
+        self,
+        *,
+        reviewer_id: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Atomically-ish take the oldest pending item (best-effort on memory;
+        Redis uses a short optimistic path). Marks status stays pending but
+        sets claimed_by / claimed_at for UI locking.
+        """
+        rows, _ = self.list(status=QueueStatus.pending.value, source=source, limit=50, offset=0)
+        # list is newest-first; claim oldest pending
+        rows = list(reversed(rows))
+        for row in rows:
+            item_id = str(row["id"])
+            if row.get("claimed_by") and row.get("claimed_at"):
+                # still claimed within 15 minutes → skip
+                try:
+                    if time.time() - float(row["claimed_at"]) < 900:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            updated = self.update(
+                item_id,
+                claimed_by=reviewer_id or "anonymous",
+                claimed_at=time.time(),
+            )
+            if updated is not None:
+                return updated
+        return None
+
+    def health(self) -> dict[str, Any]:
+        """Backend health snapshot for /ready or admin."""
+        try:
+            st = self.stats()
+            return {
+                "ok": True,
+                "backend": type(self).__name__,
+                "pending": int(st.get("pending", 0)),
+                "total": int(st.get("total", 0)),
+            }
+        except Exception as exc:  # pragma: no cover
+            return {"ok": False, "backend": type(self).__name__, "error": str(exc)}
+
 
 # ---------------------------------------------------------------------------
 # In-memory backend
@@ -135,13 +237,8 @@ class InMemoryHitlStore(HitlStore):
         )
 
     def put(self, item: dict[str, Any]) -> dict[str, Any]:
-        item = dict(item)
-        item_id = str(item.get("id") or new_item_id())
-        now = time.time()
-        item["id"] = item_id
-        item.setdefault("created_at", now)
-        item["updated_at"] = now
-        item.setdefault("status", QueueStatus.pending.value)
+        item = _normalize_item(item)
+        item_id = str(item["id"])
         with self._lock:
             self._items[item_id] = item
             self._prune_unlocked()
@@ -163,6 +260,9 @@ class InMemoryHitlStore(HitlStore):
                 return None
             row = dict(row)
             fields.pop("id", None)
+            if "status" in fields and fields["status"] is not None:
+                st = str(fields["status"]).lower()
+                fields["status"] = st if st in _VALID_STATUS else row.get("status")
             row.update(fields)
             row["updated_at"] = time.time()
             self._items[item_id] = row
@@ -267,6 +367,7 @@ class RedisHitlStore(HitlStore):
       {prefix}:ids           ZSET score=created_at
       {prefix}:status:{st}   SET of ids
       {prefix}:doc:{doc_id}  SET of ids
+      {prefix}:source:{src}  SET of ids
     """
 
     def __init__(
@@ -288,9 +389,12 @@ class RedisHitlStore(HitlStore):
             if ttl_sec is not None
             else max(0, _env_int("HITL_REDIS_TTL_SEC", 0))
         )
+        timeout = _env_float("HITL_REDIS_SOCKET_TIMEOUT", 5.0)
         self._r = client or redis_lib.Redis.from_url(
             url or os.getenv("HITL_REDIS_URL") or "redis://localhost:6379/0",
             decode_responses=True,
+            socket_timeout=timeout,
+            socket_connect_timeout=timeout,
         )
 
     def _item_key(self, item_id: str) -> str:
@@ -305,6 +409,9 @@ class RedisHitlStore(HitlStore):
     def _doc_key(self, document_id: str) -> str:
         return f"{self.prefix}:doc:{document_id}"
 
+    def _source_key(self, source: str) -> str:
+        return f"{self.prefix}:source:{source}"
+
     def _dumps(self, item: dict[str, Any]) -> str:
         return json.dumps(item, default=str)
 
@@ -315,6 +422,7 @@ class RedisHitlStore(HitlStore):
             data = json.loads(raw)
             return data if isinstance(data, dict) else None
         except json.JSONDecodeError:
+            logger.warning("HITL Redis: corrupt JSON for an item key")
             return None
 
     def _index_add(self, pipe: Any, item: dict[str, Any]) -> None:
@@ -326,6 +434,9 @@ class RedisHitlStore(HitlStore):
         doc = item.get("document_id")
         if doc:
             pipe.sadd(self._doc_key(str(doc)), item_id)
+        src = item.get("source")
+        if src:
+            pipe.sadd(self._source_key(str(src)), item_id)
 
     def _index_remove(self, pipe: Any, item: dict[str, Any]) -> None:
         item_id = str(item["id"])
@@ -336,20 +447,17 @@ class RedisHitlStore(HitlStore):
         doc = item.get("document_id")
         if doc:
             pipe.srem(self._doc_key(str(doc)), item_id)
+        src = item.get("source")
+        if src:
+            pipe.srem(self._source_key(str(src)), item_id)
 
     def _apply_ttl(self, pipe: Any, item_id: str) -> None:
         if self.ttl_sec > 0:
             pipe.expire(self._item_key(item_id), self.ttl_sec)
 
     def put(self, item: dict[str, Any]) -> dict[str, Any]:
-        item = dict(item)
-        item_id = str(item.get("id") or new_item_id())
-        now = time.time()
-        item["id"] = item_id
-        item.setdefault("created_at", now)
-        item["updated_at"] = now
-        item.setdefault("status", QueueStatus.pending.value)
-
+        item = _normalize_item(item)
+        item_id = str(item["id"])
         existing = self.get(item_id)
         pipe = self._r.pipeline()
         if existing:
@@ -361,7 +469,11 @@ class RedisHitlStore(HitlStore):
         return dict(item)
 
     def get(self, item_id: str) -> dict[str, Any] | None:
-        return self._loads(self._r.get(self._item_key(item_id)))
+        try:
+            return self._loads(self._r.get(self._item_key(item_id)))
+        except Exception as exc:
+            logger.warning("HITL Redis get failed: %s", exc)
+            return None
 
     def delete(self, item_id: str) -> bool:
         existing = self.get(item_id)
@@ -379,13 +491,19 @@ class RedisHitlStore(HitlStore):
             return None
         fields = dict(fields)
         fields.pop("id", None)
+        if "status" in fields and fields["status"] is not None:
+            st = str(fields["status"]).lower()
+            fields["status"] = st if st in _VALID_STATUS else current.get("status")
+
         old_status = str(current.get("status") or "")
         old_doc = current.get("document_id")
+        old_src = current.get("source")
         updated = dict(current)
         updated.update(fields)
         updated["updated_at"] = time.time()
         new_status = str(updated.get("status") or old_status)
         new_doc = updated.get("document_id")
+        new_src = updated.get("source")
 
         pipe = self._r.pipeline()
         pipe.set(self._item_key(item_id), self._dumps(updated))
@@ -399,6 +517,11 @@ class RedisHitlStore(HitlStore):
                 pipe.srem(self._doc_key(str(old_doc)), item_id)
             if new_doc:
                 pipe.sadd(self._doc_key(str(new_doc)), item_id)
+        if old_src != new_src:
+            if old_src:
+                pipe.srem(self._source_key(str(old_src)), item_id)
+            if new_src:
+                pipe.sadd(self._source_key(str(new_src)), item_id)
         pipe.zadd(
             self._ids_key(),
             {item_id: float(updated.get("created_at") or time.time())},
@@ -418,21 +541,34 @@ class RedisHitlStore(HitlStore):
         limit = max(1, min(int(limit), 1000))
         offset = max(0, int(offset))
 
-        if status and document_id:
-            ids = list(
-                self._r.sinter(self._status_key(status), self._doc_key(document_id))
-            )
-        elif status:
-            ids = list(self._r.smembers(self._status_key(status)))
-        elif document_id:
-            ids = list(self._r.smembers(self._doc_key(document_id)))
-        else:
-            ids = list(self._r.zrevrange(self._ids_key(), 0, -1))
+        keys: list[str] = []
+        if status:
+            keys.append(self._status_key(status))
+        if document_id:
+            keys.append(self._doc_key(document_id))
+        if source:
+            keys.append(self._source_key(source))
+
+        try:
+            if len(keys) >= 2:
+                ids = list(self._r.sinter(*keys))
+            elif len(keys) == 1:
+                ids = list(self._r.smembers(keys[0]))
+            else:
+                ids = list(self._r.zrevrange(self._ids_key(), 0, -1))
+        except Exception as exc:
+            logger.warning("HITL Redis list index failed: %s", exc)
+            ids = []
 
         rows: list[dict[str, Any]] = []
         for item_id in ids:
             row = self.get(str(item_id))
             if not row:
+                continue
+            # secondary filter if index was partial
+            if status and row.get("status") != status:
+                continue
+            if document_id and row.get("document_id") != document_id:
                 continue
             if source and row.get("source") != source:
                 continue
@@ -444,13 +580,20 @@ class RedisHitlStore(HitlStore):
 
     def stats(self) -> dict[str, int]:
         counts = {s.value: 0 for s in QueueStatus}
-        for st in QueueStatus:
-            counts[st.value] = int(self._r.scard(self._status_key(st.value)))
-        counts["total"] = int(self._r.zcard(self._ids_key()))
+        try:
+            for st in QueueStatus:
+                counts[st.value] = int(self._r.scard(self._status_key(st.value)))
+            counts["total"] = int(self._r.zcard(self._ids_key()))
+        except Exception as exc:
+            logger.warning("HITL Redis stats failed: %s", exc)
+            counts["total"] = 0
         return counts
 
     def clear(self) -> int:
-        ids = list(self._r.zrange(self._ids_key(), 0, -1))
+        try:
+            ids = list(self._r.zrange(self._ids_key(), 0, -1))
+        except Exception:
+            return 0
         n = 0
         for item_id in ids:
             if self.delete(str(item_id)):
@@ -462,6 +605,13 @@ class RedisHitlStore(HitlStore):
             return bool(self._r.ping())
         except Exception:
             return False
+
+    def health(self) -> dict[str, Any]:
+        base = super().health()
+        base["redis_ping"] = self.ping()
+        base["ok"] = bool(base.get("ok") and base["redis_ping"])
+        base["prefix"] = self.prefix
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +627,9 @@ def create_hitl_store() -> HitlStore:
     backend = (os.getenv("HITL_STORE_BACKEND") or "memory").strip().lower()
     if backend in {"redis", "redis_store"}:
         if redis_lib is None:
-            logger.warning("HITL_STORE_BACKEND=redis but redis package missing; using memory")
+            logger.warning(
+                "HITL_STORE_BACKEND=redis but redis package missing; using memory"
+            )
             return InMemoryHitlStore()
         try:
             store = RedisHitlStore()

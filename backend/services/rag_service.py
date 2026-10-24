@@ -1,8 +1,10 @@
 """
-Retrieve from Qdrant + synthesize answer.
+Retrieve from Qdrant + synthesize answer (Tier 1 enterprise).
 
-Pipeline: embed query → vector search → (optional) re-rank by score →
-truncate context → LLM (OpenAI / LLMFactory) → extractive fallback.
+Pipeline: embed query → vector search → rank → truncate context →
+LLM (OpenAI / LLMFactory) → extractive fallback.
+
+Tier 1: answer only from context; refuse when confidence is low / no hits.
 """
 
 from __future__ import annotations
@@ -12,12 +14,71 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from backend.services.embeddings import embed_query
-from backend.observability.cost import chat_cost
 
 logger = logging.getLogger(__name__)
+
+try:
+    from backend.observability.cost import chat_cost
+except ImportError:  # pragma: no cover
+
+    def chat_cost(*_a, **_k):  # type: ignore
+        return 0.0
+
+
+try:
+    from backend.services.retrieval.confidence import score_confidence, should_refuse
+except ImportError:  # pragma: no cover
+
+    def score_confidence(scores, **_kwargs):
+        if not scores:
+            return "low", 0.0
+        top = float(max(scores))
+        if top >= 0.75 and len(scores) >= 2:
+            return "high", top
+        if top >= 0.55 or top >= 0.75:
+            return "medium", top
+        return "low", top
+
+    def should_refuse(label, *, allow_medium=True):
+        if label == "low":
+            return True
+        if label == "medium" and not allow_medium:
+            return True
+        return False
+
+
+try:
+    from backend.services.generation.prompts import (
+        TIER1_SYSTEM,
+        REFUSAL_ANSWER,
+        build_context_blocks,
+    )
+
+    SYSTEM = TIER1_SYSTEM
+except ImportError:  # pragma: no cover
+    SYSTEM = (
+        "You are a precise enterprise document assistant for policies, security, "
+        "and compliance. Answer ONLY from the provided context. "
+        "If the context is insufficient, say clearly that you cannot find the answer "
+        "in the indexed documents. Be concise. Cite sources using [n] when helpful. "
+        "Do not use general world knowledge."
+    )
+    REFUSAL_ANSWER = (
+        "I could not find this in the approved indexed documents. "
+        "Try rephrasing your question, or upload the relevant policy to the library."
+    )
+
+    def build_context_blocks(sources: list[dict]) -> str:
+        blocks: list[str] = []
+        for i, s in enumerate(sources, 1):
+            name = s.get("file_name") or s.get("title") or s.get("id") or "Unknown"
+            text = (s.get("text") or "").strip() or "(empty)"
+            blocks.append(f"[{i}] {name}\n{text}")
+        return "\n\n".join(blocks)
+
 
 COLLECTION = os.getenv("QDRANT_COLLECTION") or os.getenv(
     "QDRANT_COLLECTION_NAME", "document_intelligence"
@@ -28,12 +89,16 @@ MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "12000"))
 MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "1500"))
 DEFAULT_TOP_K = int(os.getenv("RAG_DEFAULT_TOP_K", "5"))
 MIN_SCORE = os.getenv("RAG_MIN_SCORE")  # optional float as string
-
-SYSTEM = (
-    "You are a precise enterprise document assistant for policies, security, "
-    "and compliance. Answer ONLY from the provided context. "
-    "If the context is insufficient, say clearly that you cannot find the answer "
-    "in the indexed documents. Be concise. Cite sources using [n] when helpful."
+ALLOW_MEDIUM = os.getenv("RAG_ALLOW_MEDIUM", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Prefer points marked as passed security scan (set false if field not indexed yet)
+REQUIRE_SECURITY_PASS = os.getenv("RAG_REQUIRE_SECURITY_PASS", "true").lower() in (
+    "1",
+    "true",
+    "yes",
 )
 
 
@@ -54,6 +119,8 @@ class RagResult:
     answer: str
     sources: list[RagSource] = field(default_factory=list)
     confidence_score: float = 0.0
+    confidence: Literal["high", "medium", "low"] = "low"
+    refused: bool = False
     processing_time_ms: float = 0.0
     collection: str = COLLECTION
     retrieved: int = 0
@@ -83,28 +150,41 @@ def _hit_to_source(h: Any) -> RagSource:
         or payload.get("chunk_text"),
         score=round(float(score), 4) if score is not None else None,
         page=int(page) if page is not None else None,
-        doc_id=str(payload["doc_id"]) if payload.get("doc_id") else None,
+        doc_id=str(payload["doc_id"])
+        if payload.get("doc_id")
+        else (
+            str(payload["document_id"]) if payload.get("document_id") else None
+        ),
         chunk_index=int(chunk_index) if chunk_index is not None else None,
     )
 
 
 def _build_filter(filter_metadata: dict[str, Any] | None) -> Any:
-    if not filter_metadata:
-        return None
     from qdrant_client.http import models
 
-    must = []
-    for k, v in filter_metadata.items():
-        if v is None:
-            continue
-        if isinstance(v, list):
-            must.append(
-                models.FieldCondition(key=k, match=models.MatchAny(any=v))
+    must: list[Any] = []
+
+    if REQUIRE_SECURITY_PASS:
+        must.append(
+            models.FieldCondition(
+                key="security_scan_passed",
+                match=models.MatchValue(value=True),
             )
-        else:
-            must.append(
-                models.FieldCondition(key=k, match=models.MatchValue(value=v))
-            )
+        )
+
+    if filter_metadata:
+        for k, v in filter_metadata.items():
+            if v is None:
+                continue
+            if isinstance(v, list):
+                must.append(
+                    models.FieldCondition(key=k, match=models.MatchAny(any=v))
+                )
+            else:
+                must.append(
+                    models.FieldCondition(key=k, match=models.MatchValue(value=v))
+                )
+
     return models.Filter(must=must) if must else None
 
 
@@ -119,26 +199,36 @@ async def _search(
     client = await get_qdrant_client()
     qfilter = _build_filter(filter_metadata)
 
-    # Prefer query_points (Qdrant client >= 1.7)
-    if hasattr(client, "query_points"):
-        result = await client.query_points(
+    async def _do(filt: Any) -> list[Any]:
+        if hasattr(client, "query_points"):
+            result = await client.query_points(
+                collection_name=COLLECTION,
+                query=vector,
+                limit=top_k,
+                score_threshold=score_threshold,
+                query_filter=filt,
+                with_payload=True,
+            )
+            return list(result.points or [])
+        return await client.search(
             collection_name=COLLECTION,
-            query=vector,
+            query_vector=vector,
             limit=top_k,
             score_threshold=score_threshold,
-            query_filter=qfilter,
+            query_filter=filt,
             with_payload=True,
         )
-        return list(result.points or [])
 
-    return await client.search(
-        collection_name=COLLECTION,
-        query_vector=vector,
-        limit=top_k,
-        score_threshold=score_threshold,
-        query_filter=qfilter,
-        with_payload=True,
-    )
+    try:
+        return await _do(qfilter)
+    except Exception as exc:
+        # Payload field may be missing on older points — retry without filter
+        if qfilter is not None:
+            logger.warning(
+                "Filtered search failed (%s); retrying without filter", exp
+            )
+            return await _do(None)
+        raise
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -149,6 +239,25 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _build_context(sources: list[RagSource]) -> str:
+    # Prefer shared helper when available
+    try:
+        payload = [
+            {
+                "file_name": s.file_name,
+                "title": s.title,
+                "id": s.id,
+                "page": s.page,
+                "text": _truncate(s.text or "", MAX_CHUNK_CHARS),
+            }
+            for s in sources
+        ]
+        ctx = build_context_blocks(payload)
+        if len(ctx) > MAX_CONTEXT_CHARS:
+            return ctx[: MAX_CONTEXT_CHARS - 1].rstrip() + "…"
+        return ctx
+    except Exception:
+        pass
+
     blocks: list[str] = []
     used = 0
     for i, s in enumerate(sources, 1):
@@ -170,7 +279,6 @@ def _confidence(sources: list[RagSource]) -> float:
     scores = [s.score for s in sources if s.score is not None]
     if not scores:
         return 0.0
-    # Weight top hit more heavily
     top = scores[0]
     avg = sum(scores) / len(scores)
     return round(min(max(0.7 * top + 0.3 * avg, 0.0), 1.0), 3)
@@ -194,16 +302,24 @@ def _openai_chat_sync(query: str, context: str) -> str:
             },
         ],
     )
-    
-    # Track chat token costs via observability tracker
+
     if hasattr(completion, "usage") and completion.usage:
         try:
             chat_cost(
                 model=LLM_MODEL,
                 prompt_tokens=completion.usage.prompt_tokens,
                 completion_tokens=completion.usage.completion_tokens,
-                route="/api/v1/chat/rag"
+                route="/api/v1/rag/query",
             )
+        except TypeError:
+            try:
+                chat_cost(
+                    model=LLM_MODEL,
+                    prompt_tokens=completion.usage.prompt_tokens,
+                    completion_tokens=completion.usage.completion_tokens,
+                )
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -211,7 +327,6 @@ def _openai_chat_sync(query: str, context: str) -> str:
 
 
 async def _llm_factory_chat(query: str, context: str) -> str | None:
-    """Optional path via project LLMFactory if wired."""
     try:
         from backend.routers.intelligence import get_active_llm_factory  # type: ignore
     except ImportError:
@@ -242,42 +357,34 @@ async def _llm_factory_chat(query: str, context: str) -> str | None:
         else:
             return None
         return str(getattr(result, "content", None) or result).strip() or None
-    except Exception as exc:
-        logger.warning("LLMFactory synthesis failed: %s", exc)
+    except Exception as exp:
+        logger.warning("LLMFactory synthesis failed: %s", exp)
         return None
 
 
-async def synthesize(query: str, sources: list[RagSource]) -> tuple[str, float, bool, float]:
-    """
-    Returns (answer, confidence, used_llm, llm_ms).
-    """
+async def synthesize(
+    query: str, sources: list[RagSource]
+) -> tuple[str, float, bool, float]:
+    """Returns (answer, confidence, used_llm, llm_ms)."""
     conf = _confidence(sources)
     if not sources:
-        return (
-            "No relevant documents found. Seed or ingest documents into Qdrant, then retry.",
-            0.0,
-            False,
-            0.0,
-        )
+        return REFUSAL_ANSWER, 0.0, False, 0.0
 
     context = _build_context(sources)
     t_llm = time.perf_counter()
 
-    # 1) LLMFactory if available
     ans = await _llm_factory_chat(query, context)
     if ans:
         return ans, conf, True, round((time.perf_counter() - t_llm) * 1000, 2)
 
-    # 2) Direct OpenAI
     if os.getenv("OPENAI_API_KEY"):
         try:
             ans = await asyncio.to_thread(_openai_chat_sync, query, context)
             if ans:
                 return ans, conf, True, round((time.perf_counter() - t_llm) * 1000, 2)
-        except Exception as exc:
-            logger.warning("OpenAI synthesis failed: %s", exc)
+        except Exception as exp:
+            logger.warning("OpenAI synthesis failed: %s", exp)
 
-    # 3) Extractive fallback
     top = sources[0]
     extractive = (
         f"Based on {top.file_name or top.title or top.id}:\n\n"
@@ -288,6 +395,15 @@ async def synthesize(query: str, sources: list[RagSource]) -> tuple[str, float, 
     return extractive, conf, False, round((time.perf_counter() - t_llm) * 1000, 2)
 
 
+def _audit(query: str, *, refused: bool, n_sources: int) -> None:
+    try:
+        from backend.services.audit_service import audit_rag_query
+
+        audit_rag_query(query, refused=refused, n_sources=n_sources)
+    except Exception:
+        pass
+
+
 async def run_rag(
     query: str,
     top_k: int = DEFAULT_TOP_K,
@@ -296,7 +412,13 @@ async def run_rag(
 ) -> RagResult:
     query = (query or "").strip()
     if not query:
-        return RagResult(answer="Query is empty.", confidence_score=0.0, retrieved=0)
+        return RagResult(
+            answer="Query is empty.",
+            confidence_score=0.0,
+            confidence="low",
+            refused=True,
+            retrieved=0,
+        )
 
     top_k = max(1, min(int(top_k or DEFAULT_TOP_K), 20))
     if score_threshold is None and MIN_SCORE:
@@ -320,14 +442,47 @@ async def run_rag(
     search_ms = round((time.perf_counter() - t_search) * 1000, 2)
 
     sources = [_hit_to_source(h) for h in hits]
-    # Sort by score descending when present
-    sources.sort(key=lambda s: s.score if s.score is not None else -1.0, reverse=True)
+    sources.sort(
+        key=lambda s: s.score if s.score is not None else -1.0, reverse=True
+    )
+
+    scores = [float(s.score) for s in sources if s.score is not None]
+    label, top_score = score_confidence(scores)
+
+    # Tier 1 refuse: low confidence or no hits
+    if should_refuse(label, allow_medium=ALLOW_MEDIUM) or not sources:
+        total_ms = round((time.perf_counter() - t0) * 1000, 2)
+        _audit(query, refused=True, n_sources=0)
+        logger.info(
+            "RAG refuse collection=%s retrieved=%s label=%s top=%.3f total_ms=%.1f",
+            COLLECTION,
+            len(sources),
+            label,
+            top_score,
+            total_ms,
+        )
+        return RagResult(
+            answer=REFUSAL_ANSWER,
+            sources=[],
+            confidence_score=top_score if sources else 0.0,
+            confidence=label if sources else "low",
+            refused=True,
+            processing_time_ms=total_ms,
+            collection=COLLECTION,
+            retrieved=0,
+            embed_ms=embed_ms,
+            search_ms=search_ms,
+            llm_ms=0.0,
+            used_llm=False,
+        )
 
     answer, conf, used_llm, llm_ms = await synthesize(query, sources)
     total_ms = round((time.perf_counter() - t0) * 1000, 2)
+    _audit(query, refused=False, n_sources=len(sources))
 
     logger.info(
-        "RAG query collection=%s retrieved=%s embed_ms=%.1f search_ms=%.1f llm_ms=%.1f total_ms=%.1f used_llm=%s",
+        "RAG query collection=%s retrieved=%s embed_ms=%.1f search_ms=%.1f "
+        "llm_ms=%.1f total_ms=%.1f used_llm=%s confidence=%s",
         COLLECTION,
         len(sources),
         embed_ms,
@@ -335,12 +490,15 @@ async def run_rag(
         llm_ms,
         total_ms,
         used_llm,
+        label,
     )
 
     return RagResult(
         answer=answer,
         sources=sources,
         confidence_score=conf,
+        confidence=label,
+        refused=False,
         processing_time_ms=total_ms,
         collection=COLLECTION,
         retrieved=len(sources),

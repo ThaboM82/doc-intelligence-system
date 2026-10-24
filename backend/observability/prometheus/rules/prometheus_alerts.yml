@@ -1,0 +1,228 @@
+# Alert rules for Document Intelligence & Security API
+# Wire in prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/rules/prometheus_alerts.yml
+#
+# With Docker Compose, mount:
+#   ./prometheus/rules:/etc/prometheus/rules:ro
+
+groups:
+  - name: doc_intelligence_availability
+    interval: 30s
+    rules:
+      - alert: APIDown
+        expr: up{job=~"doc-intelligence-api.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: doc-intelligence
+        annotations:
+          summary: "Doc Intelligence API scrape target is down"
+          description: "Prometheus cannot scrape {{ $labels.job }} (instance {{ $labels.instance }}) for more than 2 minutes."
+
+      - alert: AppProcessDown
+        expr: app_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: doc-intelligence
+        annotations:
+          summary: "app_up is 0"
+          description: "Process reported app_up=0 on {{ $labels.instance }}."
+
+      - alert: QdrantDown
+        expr: qdrant_up == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: doc-intelligence
+        annotations:
+          summary: "Qdrant unreachable"
+          description: "qdrant_up has been 0 for more than 2 minutes on {{ $labels.instance }}."
+
+  - name: doc_intelligence_latency
+    interval: 30s
+    rules:
+      - alert: RAGHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(rag_e2e_latency_seconds_bucket[5m]))
+          ) > 8
+        for: 10m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "RAG p95 latency > 8s"
+          description: "End-to-end RAG p95 latency is {{ $value | humanizeDuration }} over the last 10 minutes."
+
+      - alert: RAGCriticalLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(rag_e2e_latency_seconds_bucket[5m]))
+          ) > 16
+        for: 5m
+        labels:
+          severity: critical
+          service: doc-intelligence
+        annotations:
+          summary: "RAG p95 latency > 16s"
+          description: "End-to-end RAG p95 latency is {{ $value | humanizeDuration }}."
+
+      - alert: HTTPHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(http_request_latency_seconds_bucket[5m]))
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "HTTP p95 latency > 5s"
+          description: "HTTP p95 latency is {{ $value | humanizeDuration }}."
+
+  - name: doc_intelligence_errors
+    interval: 30s
+    rules:
+      - alert: HighHTTP5xxRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total[5m])), 1e-9)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: doc-intelligence
+        annotations:
+          summary: "HTTP 5xx rate > 5%"
+          description: "About {{ $value | humanizePercentage }} of requests are 5xx."
+
+      - alert: ElevatedHTTP4xxRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"4.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total[5m])), 1e-9)
+          ) > 0.20
+        for: 10m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "HTTP 4xx rate > 20%"
+          description: "About {{ $value | humanizePercentage }} of requests are 4xx (auth, validation, or client errors)."
+
+      - alert: ApplicationErrorsSpike
+        expr: sum(rate(app_errors_total[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "Application error rate elevated"
+          description: "app_errors_total rate is {{ $value | humanize }} /s."
+
+  - name: doc_intelligence_ingest
+    interval: 30s
+    rules:
+      - alert: IngestFailureRatioHigh
+        expr: |
+          (
+            sum(rate(ingest_documents_total{status="failed"}[15m]))
+            /
+            clamp_min(sum(rate(ingest_documents_total[15m])), 1e-9)
+          ) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "Ingest failure ratio > 25%"
+          description: "Failed ingest share is {{ $value | humanizePercentage }} over 15m."
+
+      - alert: IngestQuarantineSpike
+        expr: sum(rate(ingest_documents_total{status="quarantined"}[10m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "Elevated quarantine rate"
+          description: "Quarantined documents rate is {{ $value | humanize }} /s."
+
+  - name: doc_intelligence_security
+    interval: 30s
+    rules:
+      - alert: CriticalSecurityEvents
+        expr: sum(rate(security_events_total{severity="critical"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+          service: doc-intelligence
+        annotations:
+          summary: "Critical security events detected"
+          description: "Critical security_events_total is non-zero (rate {{ $value | humanize }} /s)."
+
+      - alert: HighSecurityEvents
+        expr: sum(rate(security_events_total{severity="high"}[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "High-severity security events elevated"
+          description: "High severity event rate is {{ $value | humanize }} /s."
+
+      - alert: OpsRateLimitHits
+        expr: sum(rate(ops_rate_limit_hits_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "Ops rate-limit rejections elevated"
+          description: "Rate-limit hit rate is {{ $value | humanize }} /s on ops routes (/health, /ready, /metrics)."
+
+  - name: doc_intelligence_rag_quality
+    interval: 30s
+    rules:
+      - alert: HighRAGRefusalRate
+        expr: |
+          (
+            sum(rate(rag_refused_total[15m]))
+            /
+            clamp_min(
+              sum(rate(rag_e2e_latency_seconds_count[15m]))
+              + sum(rate(rag_refused_total[15m])),
+              1e-9
+            )
+          ) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "RAG refusal rate > 50%"
+          description: "Many queries lack sufficient evidence in indexed documents ({{ $value | humanizePercentage }})."
+
+      - alert: ExtractiveFallbackDominant
+        expr: |
+          (
+            sum(rate(rag_synthesis_path_total{path="extractive_fallback"}[15m]))
+            /
+            clamp_min(sum(rate(rag_synthesis_path_total[15m])), 1e-9)
+          ) > 0.6
+        for: 15m
+        labels:
+          severity: warning
+          service: doc-intelligence
+        annotations:
+          summary: "LLM synthesis mostly falling back"
+          description: "Extractive fallback is {{ $value | humanizePercentage }} of synthesis paths — check OPENAI_API_KEY / LLM factory."

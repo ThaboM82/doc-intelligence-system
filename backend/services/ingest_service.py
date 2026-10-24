@@ -20,6 +20,15 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from backend.services.embeddings import embed_texts
+
+from backend.security.event_publish import (
+    emit_file_scan_error,
+    emit_file_scan_failed,
+    emit_ingest_failed,
+    emit_ingest_indexed,
+    emit_ingest_quarantine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +84,12 @@ def extract_text_with_pages(
     """
     name = (filename or "upload.bin").lower()
 
-    if name.endswith((".txt", ".md", ".csv", ".html", ".htm", ".json", ".log")):
+    if name.endswith((".txt", ".md", ".html", ".htm", ".json", ".log")):
         text = raw.decode("utf-8", errors="replace")
+        return text, [(0, text)]
+
+    if name.endswith(".csv"):
+        text = raw.decode("utf-8-sig", errors="replace")
         return text, [(0, text)]
 
     if name.endswith(".pdf"):
@@ -94,8 +107,7 @@ def extract_text_with_pages(
             return full, pages
         except Exception as exc:
             logger.warning("PDF extract failed: %s", exc)
-            text = raw.decode("utf-8", errors="replace")
-            return text, [(0, text)]
+            return "", [(0, "")]
 
     if name.endswith((".docx", ".doc")):
         try:
@@ -108,8 +120,43 @@ def extract_text_with_pages(
             return text, [(0, text)]
         except Exception as exc:
             logger.warning("DOCX extract failed: %s", exc)
-            text = raw.decode("utf-8", errors="replace")
+            return "", [(0, "")]
+
+    if name.endswith(".xlsx"):
+        try:
+            import io
+
+            from openpyxl import load_workbook
+
+            wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            parts: list[str] = []
+            try:
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows(values_only=True):
+                        cells = [
+                            str(c).strip()
+                            for c in row
+                            if c is not None and str(c).strip()
+                        ]
+                        if cells:
+                            parts.append(" ".join(cells))
+            finally:
+                wb.close()
+            text = "\n".join(parts).strip()
             return text, [(0, text)]
+        except Exception as exc:
+            logger.warning("XLSX extract failed: %s", exc)
+            return "", [(0, "")]
+
+    if name.endswith(".xls"):
+        logger.warning("Legacy .xls not supported; use .xlsx")
+        return "", [(0, "")]
+
+    if raw[:2] == b"PK" or b"\x00" in raw[:1024]:
+        logger.warning(
+            "Unsupported or binary file type for extract: %s", filename
+        )
+        return "", [(0, "")]
 
     text = raw.decode("utf-8", errors="replace")
     return text, [(0, text)]
@@ -143,7 +190,9 @@ def chunk_text(
         end = min(start + size, n)
         if end < n:
             window = text[start:end]
-            br = max(window.rfind("\n\n"), window.rfind(". "), window.rfind("\n"))
+            br = max(
+                window.rfind("\n\n"), window.rfind(". "), window.rfind("\n")
+            )
             if br > size * 0.4:
                 end = start + br + 1
         piece = text[start:end].strip()
@@ -179,13 +228,18 @@ def chunk_pages(
 
 
 def _run_security_scan(
-    filename: str, raw: bytes, text_sample: str
-) -> tuple[bool, list[str]]:
+    filename: str,
+    raw: bytes,
+    text_sample: str,
+    *,
+    document_id: str | None = None,
+) -> tuple[bool, list[str], str]:
     """
-    Returns (passed, warnings).
+    Returns (passed, warnings, severity).
     Tries file_scanner first, then PromptInjectionDetector.
     """
     warnings: list[str] = []
+    severity = "low"
 
     try:
         from backend.security.file_scanner import scan_upload
@@ -200,24 +254,55 @@ def _run_security_scan(
         )
         if findings:
             warnings.extend(str(f) for f in list(findings)[:15])
+        sev = getattr(report, "severity", None)
+        if sev:
+            severity = str(sev).lower()
+        elif blocked:
+            severity = "high"
         if blocked:
-            return False, warnings
-        return True, warnings
+            emit_file_scan_failed(
+                document_id=document_id,
+                filename=filename,
+                reasons=warnings,
+                severity=severity,
+                confidence_score=getattr(report, "risk_score", None)
+                or getattr(report, "confidence", None),
+                detector=str(
+                    getattr(report, "detector", None) or "file_scanner"
+                ),
+            )
+            return False, warnings, severity
+        return True, warnings, severity
     except Exception as exc:
         logger.debug("file_scanner unavailable: %s", exc)
 
     try:
         from backend.security.validators import PromptInjectionDetector
 
-        report = PromptInjectionDetector.scan_text(text_sample[:80_000])
+        detector = PromptInjectionDetector()
+        report = detector.scan_text(text_sample[:80_000])
         if getattr(report, "is_flagged", False):
             patterns = list(getattr(report, "matched_patterns", None) or [])
             warnings.extend(str(p) for p in patterns[:15])
-            return False, warnings
+            severity = "high"
+            emit_file_scan_failed(
+                document_id=document_id,
+                filename=filename,
+                reasons=warnings or ["prompt_injection"],
+                severity=severity,
+                confidence_score=getattr(report, "risk_score", None),
+                detector="prompt_injection_detector",
+            )
+            return False, warnings, severity
     except Exception as exc:
         warnings.append(f"Security scan skipped: {exc}")
+        emit_file_scan_error(
+            document_id=document_id,
+            filename=filename,
+            error=str(exc),
+        )
 
-    return True, warnings
+    return True, warnings, severity
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +328,9 @@ async def _embed_texts(texts: list[str]) -> list[list[float]]:
         try:
             return await _openai_embed_batch(texts)
         except Exception as batch_exc:
-            logger.warning("Batch embed failed, per-chunk fallback: %s", batch_exc)
+            logger.warning(
+                "Batch embed failed, per-chunk fallback: %s", batch_exc
+            )
 
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
@@ -292,7 +379,6 @@ async def _upsert_chunks(
     base_payload = dict(extra_payload or {})
 
     for i, ((text, page), vec) in enumerate(zip(chunk_rows, vectors)):
-        # Keys used by documents.py list/group/delete AND rag_service
         payload: dict[str, Any] = {
             **base_payload,
             "document_id": doc_id,
@@ -353,7 +439,7 @@ async def delete_document_vectors(doc_id: str) -> int:
             )
             return 0
         except Exception as exc:
-            logger.debug("delete by %s failed: %s", key, exc)
+            logger.debug("delete by %s failed: %s", key, exp)
     return 0
 
 
@@ -365,8 +451,8 @@ def _save_bytes(
         path = directory / f"{doc_id}_{filename}"
         path.write_bytes(raw)
         return path
-    except Exception as exc:
-        logger.warning("Failed to write %s: %s", directory, exc)
+    except Exception as exp:
+        logger.warning("Failed to write %s: %s", directory, exp)
         return None
 
 
@@ -390,11 +476,24 @@ async def ingest_bytes(
 
     sample = raw[:80_000].decode("utf-8", errors="replace")
     security_ok = True
+    scan_severity = "low"
+
     if not skip_security:
-        security_ok, scan_warnings = _run_security_scan(safe_name, raw, sample)
+        security_ok, scan_warnings, scan_severity = _run_security_scan(
+            safe_name,
+            raw,
+            sample,
+            document_id=doc_id,
+        )
         warnings.extend(scan_warnings)
         if not security_ok:
             _save_bytes(QUARANTINE_DIR, doc_id, safe_name, raw)
+            emit_ingest_quarantine(
+                document_id=doc_id,
+                filename=safe_name,
+                reasons=scan_warnings,
+                severity=scan_severity,
+            )
             ms = round((time.perf_counter() - t0) * 1000, 2)
             return IngestResult(
                 document_id=doc_id,
@@ -414,6 +513,11 @@ async def ingest_bytes(
 
     if not full_text.strip():
         ms = round((time.perf_counter() - t0) * 1000, 2)
+        emit_ingest_failed(
+            document_id=doc_id,
+            filename=safe_name,
+            error="No extractable text in file.",
+        )
         return IngestResult(
             document_id=doc_id,
             filename=safe_name,
@@ -427,6 +531,11 @@ async def ingest_bytes(
     chunk_rows = chunk_pages(pages)
     if not chunk_rows:
         ms = round((time.perf_counter() - t0) * 1000, 2)
+        emit_ingest_failed(
+            document_id=doc_id,
+            filename=safe_name,
+            error="Chunking produced no segments.",
+        )
         return IngestResult(
             document_id=doc_id,
             filename=safe_name,
@@ -455,6 +564,11 @@ async def ingest_bytes(
         )
     except Exception as exc:
         logger.exception("Ingest upsert failed")
+        emit_ingest_failed(
+            document_id=doc_id,
+            filename=safe_name,
+            error=str(exc),
+        )
         ms = round((time.perf_counter() - t0) * 1000, 2)
         return IngestResult(
             document_id=doc_id,
@@ -468,6 +582,12 @@ async def ingest_bytes(
         )
 
     ms = round((time.perf_counter() - t0) * 1000, 2)
+    emit_ingest_indexed(
+        document_id=doc_id,
+        filename=safe_name,
+        chunks=n,
+        collection=COLLECTION,
+    )
     logger.info(
         "Ingested doc_id=%s file=%s chunks=%s chars=%s ms=%.1f collection=%s",
         doc_id,

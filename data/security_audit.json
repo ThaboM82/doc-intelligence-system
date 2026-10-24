@@ -1,0 +1,44 @@
+[
+  {
+    "event_id": "33e40da2-5f72-4b54-93a7-f8be4f6a3912",
+    "tenant_id": "user",
+    "action": "LOGIN_FAILURE",
+    "severity": "high",
+    "timestamp": "2026-10-24T04:37:01.304536+00:00",
+    "document_id": null,
+    "user_id": null,
+    "username": null,
+    "source_ip": null,
+    "metadata": {
+      "reason": "Insufficient permissions. Required role: admin"
+    }
+  },
+  {
+    "event_id": "a9ceb1d5-249f-468c-bb08-080ef05c0131",
+    "tenant_id": "t1",
+    "action": "LOGIN_FAILURE",
+    "severity": "high",
+    "timestamp": "2026-10-24T04:37:01.324312+00:00",
+    "document_id": null,
+    "user_id": null,
+    "username": null,
+    "source_ip": null,
+    "metadata": {
+      "reason": "Missing required permission scope: documents:write"
+    }
+  },
+  {
+    "event_id": "339793e7-ab62-4373-8938-81aea6119d90",
+    "tenant_id": "t1",
+    "action": "LOGIN_FAILURE",
+    "severity": "medium",
+    "timestamp": "2026-10-24T04:37:01.379977+00:00",
+    "document_id": null,
+    "user_id": null,
+    "username": null,
+    "source_ip": null,
+    "metadata": {
+      "reason": "Feature requires enterprise tier. Tenant is on standard tier."
+    }
+  }
+]

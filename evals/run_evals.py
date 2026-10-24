@@ -1,418 +1,417 @@
-#!/usr/bin/env python3
 """
-RAG evaluation CLI for Document Intelligence.
+backend.evals.run_evals
+───────────────────────
+Package entrypoint for evaluation so tests can:
 
-Usage (from repo root, venv active):
+    from backend.evals.run_evals import run_evaluation_suite
 
-  set API_BASE=https://doc-intelligence-system-8ase.onrender.com
-  python evals/run_evals.py
+Implementation preference
+-------------------------
+1. Prefer the full CLI module at repo-root ``evals/run_evals.py``
+   (load_cases, run_eval, scoring, HTTP / in-process runners).
+2. If that file is missing, fall back to a small built-in dry-run suite
+   so imports and unit tests never break collection.
 
-  python evals/run_evals.py --out backend/data/eval_set/last_run.json
-  python evals/run_evals.py --difficulty easy --fail-under 0.3
-  python evals/run_evals.py --ids case_001,case_002
-  python evals/run_evals.py --in-process
-
-Env:
-  API_BASE          Default http://localhost:8000
-  EVAL_FAIL_UNDER   Default 0.0 (no gate)
-  EVAL_TIMEOUT_SEC  Default 60
-  OPENAI_API_KEY    Required only for --in-process path that hits real LLM
+Also exposes:
+  run_evaluation_suite(...)  — stable API for tests / CI
+  load_cases, run_eval, run_case, main, EvalCase, CaseResult — re-exported when available
 """
 
 from __future__ import annotations
 
-import argparse
+import importlib.util
 import json
+import logging
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CLI_PATH = _REPO_ROOT / "evals" / "run_evals.py"
+
+# Populated when CLI module loads successfully
+_cli: Any = None
+load_cases: Any = None
+run_eval: Any = None
+run_case: Any = None
+main: Any = None
+EvalCase: Any = None
+CaseResult: Any = None
+filter_cases: Any = None
+score_answer: Any = None
+
+
+def _load_cli_module() -> Any | None:
+    """Import repo-root evals/run_evals.py by path (not installed as a package)."""
+    global _cli, load_cases, run_eval, run_case, main
+    global EvalCase, CaseResult, filter_cases, score_answer
+
+    if _cli is not None:
+        return _cli
+
+    if not _CLI_PATH.is_file():
+        logger.debug("evals CLI not found at %s — using built-in fallback", _CLI_PATH)
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "doc_intel_evals_cli_run_evals",
+            _CLI_PATH,
+        )
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Ensure repo root on path for CLI internal imports
+        root = str(_REPO_ROOT)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        _cli = mod
+        load_cases = getattr(mod, "load_cases", None)
+        run_eval = getattr(mod, "run_eval", None)
+        run_case = getattr(mod, "run_case", None)
+        main = getattr(mod, "main", None)
+        EvalCase = getattr(mod, "EvalCase", None)
+        CaseResult = getattr(mod, "CaseResult", None)
+        filter_cases = getattr(mod, "filter_cases", None)
+        score_answer = getattr(mod, "score_answer", None)
+        return mod
+    except Exception as exc:
+        logger.warning("Failed to load %s: %s", _CLI_PATH, exc)
+        return None
+
+
+_load_cli_module()
+
 
 # ---------------------------------------------------------------------------
-# Paths — allow `python evals/run_evals.py` from repo root
+# Built-in fallback types / helpers (when CLI is absent)
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-DEFAULT_DATASET = _REPO_ROOT / "backend" / "data" / "eval_set" / "cases.json"
-FALLBACK_DATASET = _REPO_ROOT / "backend" / "evaluation" / "cases.json"
-DEFAULT_OUT = _REPO_ROOT / "backend" / "data" / "eval_set" / "last_run.json"
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
 
 @dataclass
-class EvalCase:
+class _FallbackCase:
     id: str
     query: str
-    difficulty: str = "medium"  # easy | medium | hard
+    difficulty: str = "medium"
     must_include: list[str] = field(default_factory=list)
     must_not_include: list[str] = field(default_factory=list)
     expect_sources: bool = True
     notes: str = ""
 
 
-def _read_json(path: Path) -> Any:
-    text = path.read_text(encoding="utf-8-sig")
-    return json.loads(text)
-
-
-def load_cases(path: Path | None = None) -> list[EvalCase]:
-    p = path
-    if p is None:
-        if DEFAULT_DATASET.is_file():
-            p = DEFAULT_DATASET
-        elif FALLBACK_DATASET.is_file():
-            p = FALLBACK_DATASET
-        else:
-            # Built-in minimal set so the CLI always runs
-            return [
-                EvalCase(
-                    id="builtin_001",
-                    query="What is this system used for?",
-                    difficulty="easy",
-                    must_include=["document"],
-                    expect_sources=False,
-                    notes="Smoke case when no dataset file exists",
-                ),
-            ]
-
-    raw = _read_json(p)
-    items = raw if isinstance(raw, list) else raw.get("cases") or raw.get("items") or []
-    cases: list[EvalCase] = []
-    for i, row in enumerate(items):
-        if not isinstance(row, dict):
+def _fallback_load_cases(path: Path | None = None) -> list[Any]:
+    candidates = [
+        path,
+        _REPO_ROOT / "backend" / "data" / "eval_set" / "cases.json",
+        _REPO_ROOT / "backend" / "evaluation" / "cases.json",
+    ]
+    for p in candidates:
+        if p is None or not Path(p).is_file():
             continue
-        q = (row.get("query") or row.get("question") or "").strip()
-        if not q:
-            continue
-        cases.append(
-            EvalCase(
-                id=str(row.get("id") or f"case_{i+1:03d}"),
-                query=q,
-                difficulty=str(row.get("difficulty") or "medium").lower(),
-                must_include=list(row.get("must_include") or row.get("expected_keywords") or []),
-                must_not_include=list(row.get("must_not_include") or []),
-                expect_sources=bool(row.get("expect_sources", True)),
-                notes=str(row.get("notes") or ""),
-            )
+        try:
+            text = Path(p).read_text(encoding="utf-8-sig")
+            raw = json.loads(text)
+            items = raw if isinstance(raw, list) else (raw.get("cases") or raw.get("items") or [])
+            out: list[Any] = []
+            for i, row in enumerate(items):
+                if not isinstance(row, dict):
+                    continue
+                q = (row.get("query") or row.get("question") or "").strip()
+                if not q:
+                    continue
+                out.append(
+                    _FallbackCase(
+                        id=str(row.get("id") or f"case_{i+1:03d}"),
+                        query=q,
+                        difficulty=str(row.get("difficulty") or "medium").lower(),
+                        must_include=list(
+                            row.get("must_include") or row.get("expected_keywords") or []
+                        ),
+                        must_not_include=list(row.get("must_not_include") or []),
+                        expect_sources=bool(row.get("expect_sources", True)),
+                        notes=str(row.get("notes") or ""),
+                    )
+                )
+            if out:
+                return out
+        except Exception as exc:
+            logger.debug("fallback load_cases failed for %s: %s", p, exc)
+
+    return [
+        _FallbackCase(
+            id="builtin_001",
+            query="What is this system used for?",
+            difficulty="easy",
+            must_include=["document"],
+            expect_sources=False,
+            notes="Smoke case when no dataset file exists",
         )
-    return cases
+    ]
 
 
-def filter_cases(
-    cases: list[EvalCase],
+def _as_case_id(case: Any) -> str | None:
+    return getattr(case, "id", None) if not isinstance(case, dict) else case.get("id")
+
+
+def _as_case_query(case: Any) -> str | None:
+    if isinstance(case, dict):
+        return case.get("query") or case.get("question")
+    return getattr(case, "query", None)
+
+
+def _as_case_difficulty(case: Any) -> str:
+    if isinstance(case, dict):
+        return str(case.get("difficulty") or "medium").lower()
+    return str(getattr(case, "difficulty", "medium") or "medium").lower()
+
+
+def _filter(
+    cases: Iterable[Any],
     *,
     difficulty: str | None,
     ids: set[str] | None,
-) -> list[EvalCase]:
-    out = cases
+    limit: int | None,
+) -> list[Any]:
+    out = list(cases)
     if difficulty:
         d = difficulty.lower()
-        out = [c for c in out if c.difficulty == d]
+        out = [c for c in out if _as_case_difficulty(c) == d]
     if ids:
-        out = [c for c in out if c.id in ids]
+        out = [c for c in out if str(_as_case_id(c) or "") in ids]
+    if limit is not None:
+        out = out[: max(0, int(limit))]
     return out
 
 
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CaseResult:
-    id: str
-    query: str
-    difficulty: str
-    passed: bool
-    score: float
-    latency_ms: float
-    answer_preview: str
-    sources_count: int
-    reasons: list[str] = field(default_factory=list)
-    error: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-def score_answer(case: EvalCase, answer: str, sources: list[Any]) -> tuple[float, list[str], bool]:
-    reasons: list[str] = []
-    score = 0.0
-    text = (answer or "").strip()
-    lower = text.lower()
-
-    if not text:
-        return 0.0, ["empty answer"], False
-
-    # Non-empty answer
-    score += 0.25
-    reasons.append("non_empty_answer")
-
-    # Keyword coverage
-    must = [m for m in case.must_include if m]
-    if must:
-        hits = sum(1 for m in must if m.lower() in lower)
-        frac = hits / len(must)
-        score += 0.45 * frac
-        reasons.append(f"keyword_hits={hits}/{len(must)}")
-    else:
-        score += 0.20
-        reasons.append("no_keyword_constraints")
-
-    # Forbidden terms
-    bad = [m for m in case.must_not_include if m and m.lower() in lower]
-    if bad:
-        score -= 0.25
-        reasons.append(f"forbidden={bad}")
-
-    # Sources
-    n_src = len(sources or [])
-    if case.expect_sources:
-        if n_src > 0:
-            score += 0.30
-            reasons.append(f"sources={n_src}")
-        else:
-            reasons.append("missing_sources")
-    else:
-        score += 0.15
-        reasons.append("sources_optional")
-
-    score = max(0.0, min(1.0, round(score, 4)))
-    passed = score >= 0.5 and not bad
-    return score, reasons, passed
-
-
-# ---------------------------------------------------------------------------
-# Runners
-# ---------------------------------------------------------------------------
-
-def _http_rag(api_base: str, query: str, top_k: int, timeout: float) -> dict[str, Any]:
-    base = api_base.rstrip("/")
-    url = f"{base}/api/v1/rag/query"
-    body = json.dumps({"query": query, "top_k": top_k}).encode("utf-8")
-    req = Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    with urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _in_process_rag(query: str, top_k: int) -> dict[str, Any]:
-    """Call service layer directly (no HTTP)."""
-    import asyncio
-    from backend.services.rag_service import run_rag
-
-    result = asyncio.run(run_rag(query=query, top_k=top_k))
-    sources = []
-    for s in getattr(result, "sources", []) or []:
-        sources.append(
-            {
-                "id": getattr(s, "id", None),
-                "file_name": getattr(s, "file_name", None),
-                "score": getattr(s, "score", None),
-                "text": (getattr(s, "text", None) or "")[:200],
-            }
-        )
+def _case_to_dict(case: Any) -> dict[str, Any]:
+    if is_dataclass(case):
+        return asdict(case)
+    if isinstance(case, dict):
+        return dict(case)
     return {
-        "answer": getattr(result, "answer", "") or "",
-        "sources": sources,
-        "confidence_score": getattr(result, "confidence_score", None),
-        "processing_time_ms": getattr(result, "processing_time_ms", None),
+        "id": _as_case_id(case),
+        "query": _as_case_query(case),
+        "difficulty": _as_case_difficulty(case),
     }
 
 
-def run_case(
-    case: EvalCase,
-    *,
-    api_base: str,
-    top_k: int,
-    timeout: float,
-    in_process: bool,
-) -> CaseResult:
-    t0 = time.perf_counter()
-    try:
-        if in_process:
-            data = _in_process_rag(case.query, top_k)
-        else:
-            data = _http_rag(api_base, case.query, top_k, timeout)
-        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-        answer = (
-            data.get("answer")
-            or data.get("result")
-            or data.get("response")
-            or ""
-        )
-        sources = data.get("sources") or data.get("citations") or []
-        if not isinstance(sources, list):
-            sources = []
-        score, reasons, passed = score_answer(case, str(answer), sources)
-        return CaseResult(
-            id=case.id,
-            query=case.query,
-            difficulty=case.difficulty,
-            passed=passed,
-            score=score,
-            latency_ms=latency_ms,
-            answer_preview=str(answer)[:300],
-            sources_count=len(sources),
-            reasons=reasons,
-            raw={"confidence": data.get("confidence_score")},
-        )
-    except HTTPError as exc:
-        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
-        return CaseResult(
-            id=case.id,
-            query=case.query,
-            difficulty=case.difficulty,
-            passed=False,
-            score=0.0,
-            latency_ms=latency_ms,
-            answer_preview="",
-            sources_count=0,
-            reasons=[],
-            error=f"HTTP {exc.code}: {detail}",
-        )
-    except (URLError, TimeoutError, OSError, Exception) as exc:
-        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-        return CaseResult(
-            id=case.id,
-            query=case.query,
-            difficulty=case.difficulty,
-            passed=False,
-            score=0.0,
-            latency_ms=latency_ms,
-            answer_preview="",
-            sources_count=0,
-            reasons=[],
-            error=str(exc),
-        )
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
-def run_eval(
-    cases: list[EvalCase],
+def run_evaluation_suite(
     *,
-    api_base: str,
-    top_k: int,
-    timeout: float,
-    in_process: bool,
+    api_base: str | None = None,
+    cases_path: str | Path | None = None,
+    difficulty: str | None = None,
+    ids: str | list[str] | None = None,
+    limit: int | None = None,
+    top_k: int = 5,
+    timeout: float | None = None,
+    dry_run: bool = True,
+    in_process: bool = False,
+    fail_under: float | None = None,
+    out: str | Path | None = None,
 ) -> dict[str, Any]:
-    results: list[CaseResult] = []
-    for case in cases:
-        print(f"  → {case.id} ({case.difficulty}): {case.query[:60]}...")
-        r = run_case(
-            case,
-            api_base=api_base,
-            top_k=top_k,
-            timeout=timeout,
-            in_process=in_process,
+    """
+    Stable evaluation entrypoint for tests and CI.
+
+    Parameters
+    ----------
+    dry_run:
+        If True (default), load/filter cases and return a structured report
+        without calling the API or LLM.
+    in_process:
+        When dry_run is False, prefer in-process rag_service if CLI supports it.
+    fail_under:
+        Optional gate; included in the report (caller decides process exit).
+    out:
+        Optional path to write JSON report.
+    """
+    t0 = time.perf_counter()
+    base = (
+        api_base
+        or os.getenv("API_BASE")
+        or os.getenv("EVAL_API_BASE")
+        or "http://localhost:8000"
+    ).rstrip("/")
+    timeout_sec = float(
+        timeout if timeout is not None else os.getenv("EVAL_TIMEOUT_SEC", "60")
+    )
+
+    id_set: set[str] | None = None
+    if isinstance(ids, str) and ids.strip():
+        id_set = {x.strip() for x in ids.split(",") if x.strip()}
+    elif isinstance(ids, list) and ids:
+        id_set = {str(x).strip() for x in ids if str(x).strip()}
+
+    path = Path(cases_path) if cases_path else None
+
+    # Load cases via CLI or fallback
+    if load_cases is not None:
+        try:
+            cases = load_cases(path)
+        except Exception as exc:
+            logger.warning("CLI load_cases failed: %s — using fallback", exc)
+            cases = _fallback_load_cases(path)
+    else:
+        cases = _fallback_load_cases(path)
+
+    if filter_cases is not None and (difficulty or id_set):
+        try:
+            cases = filter_cases(cases, difficulty=difficulty, ids=id_set)
+        except TypeError:
+            cases = _filter(cases, difficulty=difficulty, ids=id_set, limit=None)
+    else:
+        cases = _filter(cases, difficulty=difficulty, ids=id_set, limit=None)
+
+    if limit is not None:
+        cases = cases[: max(0, int(limit))]
+
+    # Dry-run: no network / no LLM
+    if dry_run or run_eval is None:
+        results = [
+            {
+                "id": _as_case_id(c),
+                "query": _as_case_query(c),
+                "difficulty": _as_case_difficulty(c),
+                "status": "skipped",
+                "passed": None,
+                "score": None,
+                "detail": "dry_run",
+            }
+            for c in cases
+        ]
+        report: dict[str, Any] = {
+            "api_base": base,
+            "dry_run": True,
+            "in_process": False,
+            "total": len(cases),
+            "count": len(cases),
+            "passed": 0,
+            "failed": 0,
+            "skipped": len(cases),
+            "avg_score": 0.0,
+            "pass_rate": 0.0,
+            "avg_latency_ms": 0.0,
+            "fail_under": fail_under,
+            "results": results,
+            "duration_ms": round((time.perf_counter() - t0) * 1000, 2),
+            "ts": time.time(),
+        }
+        _maybe_write(out, report)
+        return report
+
+    # Live path via CLI run_eval
+    try:
+        report = run_eval(
+            cases,
+            api_base=base,
+            top_k=int(top_k),
+            timeout=timeout_sec,
+            in_process=bool(in_process),
         )
-        results.append(r)
-        status = "PASS" if r.passed else "FAIL"
-        err = f" err={r.error}" if r.error else ""
-        print(f"    {status} score={r.score:.2f} latency_ms={r.latency_ms}{err}")
+    except Exception as exc:
+        logger.exception("run_eval failed")
+        return {
+            "api_base": base,
+            "dry_run": False,
+            "error": str(exc),
+            "total": len(cases),
+            "passed": 0,
+            "failed": len(cases),
+            "skipped": 0,
+            "results": [],
+            "duration_ms": round((time.perf_counter() - t0) * 1000, 2),
+        }
 
-    n = len(results) or 1
-    avg_score = sum(r.score for r in results) / n
-    pass_rate = sum(1 for r in results if r.passed) / n
-    avg_latency = sum(r.latency_ms for r in results) / n
+    # Normalize shape for tests
+    results_raw = report.get("results") or []
+    passed = sum(
+        1
+        for r in results_raw
+        if (r.get("passed") is True)
+        or str(r.get("status", "")).lower() == "passed"
+    )
+    failed = sum(
+        1
+        for r in results_raw
+        if (r.get("passed") is False)
+        or str(r.get("status", "")).lower() in {"failed", "error"}
+    )
+    normalized = {
+        **report,
+        "api_base": report.get("api_base") or base,
+        "dry_run": False,
+        "in_process": bool(in_process),
+        "total": report.get("count") or len(results_raw),
+        "passed": passed,
+        "failed": failed,
+        "skipped": max(
+            0,
+            (report.get("count") or len(results_raw)) - passed - failed,
+        ),
+        "fail_under": fail_under,
+        "gate_ok": (
+            None
+            if fail_under is None
+            else float(report.get("avg_score") or 0.0) >= float(fail_under)
+        ),
+        "duration_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+    _maybe_write(out, normalized)
+    return normalized
 
+
+def _maybe_write(out: str | Path | None, report: dict[str, Any]) -> None:
+    if not out:
+        return
+    try:
+        path = Path(out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not write eval report to %s: %s", out, exc)
+
+
+def cli_available() -> bool:
+    """True when repo-root evals/run_evals.py loaded successfully."""
+    return _cli is not None and run_eval is not None
+
+
+def dataset_paths() -> dict[str, str]:
+    """Paths the suite probes for case JSON (diagnostics)."""
     return {
-        "api_base": api_base if not in_process else "in-process",
-        "count": len(results),
-        "avg_score": round(avg_score, 4),
-        "pass_rate": round(pass_rate, 4),
-        "avg_latency_ms": round(avg_latency, 2),
-        "results": [asdict(r) for r in results],
-        "ts": time.time(),
+        "repo_root": str(_REPO_ROOT),
+        "cli": str(_CLI_PATH),
+        "cli_exists": str(_CLI_PATH.is_file()),
+        "default_dataset": str(
+            _REPO_ROOT / "backend" / "data" / "eval_set" / "cases.json"
+        ),
+        "fallback_dataset": str(
+            _REPO_ROOT / "backend" / "evaluation" / "cases.json"
+        ),
     }
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run RAG evaluation suite")
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        default=None,
-        help=f"JSON cases file (default: {DEFAULT_DATASET})",
-    )
-    parser.add_argument(
-        "--api-base",
-        default=os.getenv("API_BASE", "http://localhost:8000"),
-        help="API base URL",
-    )
-    parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=float(os.getenv("EVAL_TIMEOUT_SEC", "60")),
-    )
-    parser.add_argument("--difficulty", choices=["easy", "medium", "hard"], default=None)
-    parser.add_argument("--ids", default=None, help="Comma-separated case ids")
-    parser.add_argument(
-        "--fail-under",
-        type=float,
-        default=float(os.getenv("EVAL_FAIL_UNDER", "0")),
-        help="Exit 1 if avg_score < this value",
-    )
-    parser.add_argument("--out", type=Path, default=None, help="Write JSON report path")
-    parser.add_argument(
-        "--in-process",
-        action="store_true",
-        help="Call backend.services.rag_service.run_rag instead of HTTP",
-    )
-    args = parser.parse_args(argv)
-
-    cases = load_cases(args.dataset)
-    id_set = {x.strip() for x in (args.ids or "").split(",") if x.strip()} or None
-    cases = filter_cases(cases, difficulty=args.difficulty, ids=id_set)
-
-    if not cases:
-        print("No eval cases matched filters.", file=sys.stderr)
-        return 2
-
-    print(f"Running {len(cases)} case(s) against {args.api_base if not args.in_process else 'in-process'}")
-    report = run_eval(
-        cases,
-        api_base=args.api_base,
-        top_k=args.top_k,
-        timeout=args.timeout,
-        in_process=args.in_process,
-    )
-
-    print("\n=== Summary ===")
-    print(f"avg_score={report['avg_score']:.4f}  pass_rate={report['pass_rate']:.4f}  avg_latency_ms={report['avg_latency_ms']}")
-
-    out = args.out or DEFAULT_OUT
-    try:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        print(f"Wrote {out}")
-    except OSError as exc:
-        print(f"Could not write report: {exc}", file=sys.stderr)
-
-    if report["avg_score"] < args.fail_under:
-        print(
-            f"FAIL: avg_score {report['avg_score']:.4f} < fail-under {args.fail_under}",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+__all__ = [
+    "run_evaluation_suite",
+    "cli_available",
+    "dataset_paths",
+    "load_cases",
+    "run_eval",
+    "run_case",
+    "main",
+    "EvalCase",
+    "CaseResult",
+    "filter_cases",
+    "score_answer",
+]

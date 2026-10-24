@@ -26,6 +26,20 @@ logger = logging.getLogger("security.validators")
 if not logger.handlers:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
+# --- Compatibility Aliases for Integration Tests ---
+
+class HeaderValidationResult:
+    def __init__(self, is_valid: bool = True, reason: str = ""):
+        self.is_valid = is_valid
+        self.reason = reason
+
+
+class PromptInjectionResult:
+    def __init__(self, flagged: bool = False, confidence: float = 0.0, category: str = "none"):
+        self.flagged = flagged
+        self.confidence = confidence
+        self.category = category
+
 # ---------------------------------------------------------------------------
 # Environment / tokens
 # ---------------------------------------------------------------------------
