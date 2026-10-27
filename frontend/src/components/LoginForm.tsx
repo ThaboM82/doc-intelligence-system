@@ -1,357 +1,433 @@
-/**
- * LoginForm — email/password (/api/v1/auth), optional JWT paste, demo session.
- */
-import React, { useState } from 'react';
+ import React, {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+
 import {
-  Shield,
-  Key,
-  Sparkles,
-  AlertCircle,
+  ShieldCheck,
   Loader2,
-  Mail,
-  Lock,
-  UserPlus,
+  Eye,
+  EyeOff,
   LogIn,
-} from 'lucide-react';
-import { apiClient } from '../lib/apiClient';
+  AlertCircle,
+  Wifi,
+  WifiOff,
+  Lock,
+} from "lucide-react";
 
-const AUTH_STORAGE_KEY = 'doc_intel_access_token';
-const AUTH_STORAGE_LEGACY = 'doc_intelligence_token';
+import authService from "../services/auth";
 
-type Mode = 'login' | 'register';
-
-type Props = {
-  onLoginSuccess?: (token: string) => void;
-  allowDemo?: boolean;
-};
-
-function errorText(err: unknown): string {
-  const e = err as {
-    message?: unknown;
-    detail?: unknown;
-    status?: number;
-    code?: string;
-  };
-  if (e?.code === 'CIRCUIT_OPEN') {
-    return 'API circuit is open. Wait a few seconds and retry (Render may be waking up).';
-  }
-  const d = e?.detail ?? e?.message;
-  if (typeof d === 'string') return d;
-  if (d && typeof d === 'object') {
-    try {
-      return JSON.stringify(d);
-    } catch {
-      /* ignore */
-    }
-  }
-  return 'Authentication failed. Check credentials, CORS, and VITE_API_URL.';
+export interface LoginFormProps {
+  onLoginSuccess?: () => void;
 }
 
-export default function LoginForm({ onLoginSuccess, allowDemo = true }: Props) {
-  const [mode, setMode] = useState<Mode>('login');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [fullName, setFullName] = useState('');
-  const [showAdvancedToken, setShowAdvancedToken] = useState(false);
-  const [tokenInput, setTokenInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const apiBase =
-    (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ||
-    (typeof apiClient.getBaseUrl === 'function'
-      ? apiClient.getBaseUrl()
-      : 'http://localhost:8000');
-
-  const finish = (token: string) => {
-    if (typeof apiClient.setAuthToken === 'function') {
-      apiClient.setAuthToken(token);
-    }
-    try {
-      localStorage.setItem(AUTH_STORAGE_KEY, token);
-      localStorage.setItem(AUTH_STORAGE_LEGACY, token);
-      localStorage.setItem('auth_token', token);
-    } catch {
-      /* ignore */
-    }
-    onLoginSuccess?.(token);
+function getFriendlyError(
+  error: unknown
+): string {
+  const err = error as {
+    code?: string;
+    message?: string;
+    response?: {
+      status?: number;
+      data?: {
+        detail?: string;
+      };
+    };
   };
 
-  const handleCredentialSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
+  if (
+    err?.code === "ERR_NETWORK"
+  ) {
+    return "Unable to reach authentication service.";
+  }
 
-    const em = email.trim().toLowerCase();
-    if (!em || !password) {
-      setError('Email and password are required.');
-      setLoading(false);
-      return;
-    }
-    if (password.length < 8) {
-      setError('Password must be at least 8 characters.');
-      setLoading(false);
-      return;
-    }
+  const status =
+    err?.response?.status;
 
-    try {
-      if (mode === 'register') {
-        await apiClient.register({
-          email: em,
-          password,
-          full_name: fullName.trim() || undefined,
-        });
-        const tok = await apiClient.login({ email: em, password });
-        finish(tok.access_token);
-      } else {
-        const tok = await apiClient.login({ email: em, password });
-        finish(tok.access_token);
-      }
-    } catch (err) {
-      console.error(err);
-      setError(errorText(err));
-    } finally {
-      setLoading(false);
-    }
-  };
+  switch (status) {
+    case 400:
+      return "Invalid request.";
 
-  const handleTokenPaste = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
-    const activeToken = tokenInput.trim();
-    if (!activeToken) {
-      setError('Paste a JWT access_token first.');
-      setLoading(false);
-      return;
-    }
+    case 401:
+      return "Invalid username or password.";
 
-    try {
-      apiClient.setAuthToken(activeToken);
-      try {
-        await apiClient.me();
-      } catch {
-        await apiClient.getHealth();
-      }
-      finish(activeToken);
-    } catch (err) {
-      console.error(err);
-      apiClient.setAuthToken(null);
-      setError(errorText(err));
-    } finally {
-      setLoading(false);
-    }
-  };
+    case 403:
+      return "Access denied.";
 
-  const handleDemoLogin = async () => {
-    if (!allowDemo) return;
-    setLoading(true);
-    setError(null);
-    try {
-      try {
-        const tok = await apiClient.login({
-          email: 'demo@docintel.local',
-          password: 'demo-password-change-me',
-        });
-        finish(tok.access_token);
-        return;
-      } catch {
-        /* fall through */
-      }
+    case 429:
+      return "Too many login attempts. Please wait.";
 
-      await apiClient.getHealth();
-      finish('demo_local_session');
-    } catch (err) {
-      setError(
-        `${errorText(err)} — Start the API or set VITE_API_URL to your Render service.`
+    case 500:
+      return "Authentication service unavailable.";
+
+    default:
+      return (
+        err?.response?.data
+          ?.detail ||
+        err?.message ||
+        "Login failed."
       );
-    } finally {
-      setLoading(false);
-    }
-  };
+  }
+}
+
+export default function LoginForm({
+  onLoginSuccess,
+}: LoginFormProps) {
+  const [
+    username,
+    setUsername,
+  ] = useState("");
+
+  const [
+    password,
+    setPassword,
+  ] = useState("");
+
+  const [
+    loading,
+    setLoading,
+  ] = useState(false);
+
+  const [
+    error,
+    setError,
+  ] = useState<
+    string | null
+  >(null);
+
+  const [
+    showPassword,
+    setShowPassword,
+  ] = useState(false);
+
+  const [
+    apiHealthy,
+    setApiHealthy,
+  ] = useState<
+    boolean | null
+  >(null);
+
+  const [
+    loginAttempts,
+    setLoginAttempts,
+  ] = useState(0);
+
+  const [
+    capsLock,
+    setCapsLock,
+  ] = useState(false);
+
+  const usernameRef =
+    useRef<HTMLInputElement>(
+      null
+    );
+
+  useEffect(() => {
+    usernameRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const checkHealth =
+      async () => {
+        try {
+          await authService.health();
+
+          if (mounted) {
+            setApiHealthy(true);
+          }
+        } catch {
+          if (mounted) {
+            setApiHealthy(false);
+          }
+        }
+      };
+
+    void checkHealth();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const handleLogin =
+    useCallback(
+      async (
+        e: React.FormEvent
+      ) => {
+        e.preventDefault();
+
+        if (loading) {
+          return;
+        }
+
+        setError(null);
+
+        if (
+          !username.trim()
+        ) {
+          setError(
+            "Username is required."
+          );
+
+          return;
+        }
+
+        if (!password) {
+          setError(
+            "Password is required."
+          );
+
+          return;
+        }
+
+        setLoading(true);
+
+        try {
+          await authService.login(
+            username.trim(),
+            password
+          );
+
+          await authService.me();
+
+          onLoginSuccess?.();
+        } catch (err) {
+          setLoginAttempts(
+            (current) =>
+              current + 1
+          );
+
+          setError(
+            getFriendlyError(
+              err
+            )
+          );
+        } finally {
+          setLoading(false);
+        }
+      },
+      [
+        username,
+        password,
+        loading,
+        onLoginSuccess,
+      ]
+    );
 
   return (
-    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
-      <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-xl p-8 shadow-2xl space-y-6">
-        <div className="text-center space-y-2">
-          <div className="inline-flex p-3 bg-blue-600/10 border border-blue-500/20 rounded-xl text-blue-400 shadow-inner">
-            <Shield className="w-8 h-8" />
+    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-slate-50 via-white to-blue-50 px-4 py-10">
+      <div className="w-full max-w-md">
+        <div className="mb-8 text-center">
+          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-500/30">
+            <ShieldCheck className="h-8 w-8" />
           </div>
-          <h2 className="text-xl font-bold text-slate-100 tracking-tight">
-            Enterprise Document Intelligence
-          </h2>
-          <p className="text-xs text-slate-400">
-            Secure RAG, threat telemetry &amp; vector analytics
-          </p>
-          <p className="text-[10px] text-slate-600 font-mono truncate" title={apiBase}>
-            API: {apiBase}
+
+          <h1 className="text-3xl font-bold tracking-tight text-slate-900">
+            Doc Intelligence
+          </h1>
+
+          <p className="mt-2 text-sm text-slate-500">
+            Secure access to document
+            ingestion, search, governance,
+            and AI intelligence services.
           </p>
         </div>
 
-        {error && (
-          <div className="p-3 bg-red-950/40 border border-red-800/50 rounded-lg flex items-start space-x-2 text-red-300 text-xs">
-            <AlertCircle className="w-4 h-4 flex-shrink-0 text-red-400 mt-0.5" />
-            <span>{error}</span>
+        <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xl shadow-slate-200/60">
+          <div className="mb-6 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-sm">
+              {apiHealthy ? (
+                <>
+                  <Wifi className="h-4 w-4 text-emerald-500" />
+                  <span className="text-emerald-600">
+                    API Online
+                  </span>
+                </>
+              ) : (
+                <>
+                  <WifiOff className="h-4 w-4 text-red-500" />
+                  <span className="text-red-600">
+                    API Offline
+                  </span>
+                </>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1 text-xs text-slate-500">
+              <Lock className="h-3 w-3" />
+              Secure Session
+            </div>
           </div>
-        )}
 
-        <div className="flex rounded-lg border border-slate-800 p-1 bg-slate-950/50">
-          <button
-            type="button"
-            onClick={() => setMode('login')}
-            className={`flex-1 py-2 text-xs font-semibold rounded-md transition ${
-              mode === 'login'
-                ? 'bg-slate-800 text-blue-300'
-                : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            <span className="inline-flex items-center gap-1.5 justify-center w-full">
-              <LogIn className="w-3.5 h-3.5" /> Sign in
-            </span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode('register')}
-            className={`flex-1 py-2 text-xs font-semibold rounded-md transition ${
-              mode === 'register'
-                ? 'bg-slate-800 text-blue-300'
-                : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            <span className="inline-flex items-center gap-1.5 justify-center w-full">
-              <UserPlus className="w-3.5 h-3.5" /> Register
-            </span>
-          </button>
-        </div>
-
-        <form onSubmit={(e) => void handleCredentialSubmit(e)} className="space-y-3">
-          {mode === 'register' && (
-            <div className="space-y-1">
-              <label className="text-xs text-slate-400">Full name</label>
-              <input
-                type="text"
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                autoComplete="name"
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                placeholder="Optional"
-              />
+          {error && (
+            <div
+              role="alert"
+              className="mb-4 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-3 text-sm text-red-800"
+            >
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{error}</span>
             </div>
           )}
 
-          <div className="space-y-1">
-            <label className="text-xs text-slate-400">Email</label>
-            <div className="relative">
-              <Mail className="absolute left-3 top-3 w-4 h-4 text-slate-500" />
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                autoComplete="email"
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-10 pr-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                placeholder="you@company.com"
-              />
+          {loginAttempts >=
+            3 && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-900">
+              Multiple failed sign-in
+              attempts detected.
             </div>
-          </div>
+          )}
 
-          <div className="space-y-1">
-            <label className="text-xs text-slate-400">Password</label>
-            <div className="relative">
-              <Lock className="absolute left-3 top-3 w-4 h-4 text-slate-500" />
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-                minLength={8}
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-10 pr-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                placeholder="••••••••"
-              />
-            </div>
-          </div>
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition flex items-center justify-center space-x-2 shadow-lg shadow-blue-600/20 disabled:opacity-50"
-          >
-            {loading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : mode === 'login' ? (
-              <LogIn className="w-4 h-4" />
-            ) : (
-              <UserPlus className="w-4 h-4" />
-            )}
-            <span>
-              {loading
-                ? 'Please wait…'
-                : mode === 'login'
-                  ? 'Sign in'
-                  : 'Create account'}
-            </span>
-          </button>
-        </form>
-
-        {allowDemo && (
-          <button
-            type="button"
-            disabled={loading}
-            onClick={() => void handleDemoLogin()}
-            className="w-full py-2.5 px-4 bg-slate-800 border border-slate-700 text-slate-200 text-sm font-medium rounded-lg transition flex items-center justify-center space-x-2 disabled:opacity-50 hover:bg-slate-750"
-          >
-            <Sparkles className="w-4 h-4 text-blue-400" />
-            <span>Continue with demo session</span>
-          </button>
-        )}
-
-        <div className="text-center">
-          <button
-            type="button"
-            onClick={() => setShowAdvancedToken((v) => !v)}
-            className="text-xs text-slate-500 hover:text-slate-400 transition underline underline-offset-4"
-          >
-            {showAdvancedToken ? 'Hide advanced token' : 'Paste JWT / API token'}
-          </button>
-        </div>
-
-        {showAdvancedToken && (
           <form
-            onSubmit={(e) => void handleTokenPaste(e)}
-            className="pt-2 border-t border-slate-800 space-y-2"
+            onSubmit={(e) =>
+              void handleLogin(e)
+            }
+            className="space-y-4"
           >
-            <label className="block text-xs font-medium text-slate-400">
-              Bearer access_token
-            </label>
-            <div className="relative">
-              <Key className="absolute left-3 top-3 w-4 h-4 text-slate-500" />
+            <div>
+              <label
+                htmlFor="username"
+                className="mb-1 block text-xs font-semibold text-slate-600"
+              >
+                Username
+              </label>
+
               <input
-                type="password"
-                value={tokenInput}
-                onChange={(e) => setTokenInput(e.target.value)}
-                placeholder="eyJhbGciOiJIUzI1NiIs..."
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-10 pr-4 py-2 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-blue-500"
+                ref={
+                  usernameRef
+                }
+                id="username"
+                type="text"
+                autoComplete="username"
+                value={
+                  username
+                }
+                disabled={
+                  loading
+                }
+                onChange={(e) =>
+                  setUsername(
+                    e.target
+                      .value
+                  )
+                }
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none ring-blue-500/30 focus:border-blue-400 focus:ring-2"
+                placeholder="username"
               />
             </div>
+
+            <div>
+              <label
+                htmlFor="password"
+                className="mb-1 block text-xs font-semibold text-slate-600"
+              >
+                Password
+              </label>
+
+              <div className="relative">
+                <input
+                  id="password"
+                  type={
+                    showPassword
+                      ? "text"
+                      : "password"
+                  }
+                  autoComplete="current-password"
+                  value={
+                    password
+                  }
+                  disabled={
+                    loading
+                  }
+                  onKeyUp={(
+                    event
+                  ) =>
+                    setCapsLock(
+                      event.getModifierState(
+                        "CapsLock"
+                      )
+                    )
+                  }
+                  onChange={(e) =>
+                    setPassword(
+                      e.target
+                        .value
+                    )
+                  }
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-10 text-sm text-slate-900 outline-none ring-blue-500/30 focus:border-blue-400 focus:ring-2"
+                  placeholder="••••••••"
+                />
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setShowPassword(
+                      (
+                        value
+                      ) =>
+                        !value
+                    )
+                  }
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-slate-400 hover:text-slate-700"
+                  aria-label={
+                    showPassword
+                      ? "Hide password"
+                      : "Show password"
+                  }
+                >
+                  {showPassword ? (
+                    <EyeOff className="h-4 w-4" />
+                  ) : (
+                    <Eye className="h-4 w-4" />
+                  )}
+                </button>
+              </div>
+
+              {capsLock && (
+                <p className="mt-2 text-xs text-amber-600">
+                  Caps Lock is enabled.
+                </p>
+              )}
+            </div>
+
             <button
               type="submit"
-              disabled={loading || !tokenInput.trim()}
-              className="w-full py-2 rounded-lg bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-200 disabled:opacity-50"
+              disabled={
+                loading
+              }
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white shadow-md shadow-blue-500/20 transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              Use this token
+              {loading ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Signing in...
+                </>
+              ) : (
+                <>
+                  <LogIn className="h-4 w-4" />
+                  Sign In
+                </>
+              )}
             </button>
           </form>
-        )}
 
-        <div className="pt-2 border-t border-slate-800/60 text-center space-y-1">
-          <span className="text-[11px] text-slate-500 font-mono block">
-            Auth: POST /api/v1/auth/login · /register
-          </span>
-          <span className="text-[11px] text-slate-600">
-            First registered user may become admin if the backend is configured that way.
-          </span>
+          <div className="mt-6 border-t border-slate-100 pt-4 text-center">
+            <p className="text-xs text-slate-400">
+              Protected by JWT
+              authentication, refresh-token
+              rotation, CSRF validation, and
+              secure HttpOnly cookies.
+            </p>
+          </div>
         </div>
+
+        <p className="mt-6 text-center text-[11px] text-slate-400">
+          Doc Intelligence Platform · Secure
+          Enterprise Authentication
+        </p>
       </div>
     </div>
   );
